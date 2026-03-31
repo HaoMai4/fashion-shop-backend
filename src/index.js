@@ -1,28 +1,25 @@
-const express = require('express');
-const cors = require('cors');
-require('dotenv').config();
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const connectDB = require("./config/DB");
+
+const userRoutes = require("./routes/user.route");
 
 const app = express();
 
-// Middleware
-app.use(cors()); // Cho phép kết nối từ Frontend
-app.use(express.json()); // Cho phép server đọc dữ liệu JSON gửi lên
+// middleware
+app.use(cors());
+app.use(express.json());
 
-// Route chạy thử
-app.get('/', (req, res) => {
-  res.send('Server Fashion Shop đang chạy thành công!');
-});
+// connect DB
+connectDB();
 
-// Lấy danh sách sản phẩm mẫu (Mock Data cho Khóa luận)
-app.get('/api/products', (req, res) => {
-  const products = [
-    { id: 1, name: "Áo thun Monochrome", price: 250000, category: "Men" },
-    { id: 2, name: "Váy trắng Minimalist", price: 450000, category: "Women" }
-  ];
-  res.json(products);
+// routes
+app.use("/api/users", userRoutes);
+
+app.get("/", (req, res) => {
+  res.send("API is running...");
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
