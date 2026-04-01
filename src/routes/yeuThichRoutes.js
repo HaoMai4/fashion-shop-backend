@@ -10,3 +10,5 @@ router.get("/", protect, ytController.getWishlist);
 router.delete("/:id", protect, ytController.removeFromWishlist);
 
 module.exports = router;
+
+console.log("Yêu thích routes loaded");

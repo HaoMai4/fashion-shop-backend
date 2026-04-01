@@ -8,3 +8,5 @@ router.put("/:id", kmController.updateKhuyenMai);
 router.delete("/:id", kmController.deleteKhuyenMai);
 
 module.exports = router;
+
+console.log("Khuyến mãi routes loaded");

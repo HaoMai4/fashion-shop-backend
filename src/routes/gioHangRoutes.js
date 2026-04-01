@@ -1,16 +1,14 @@
 const express = require("express");
 const router = express.Router();
 
-const {
-  createCart,
-  addToCart,
-  getCart
-} = require("../controllers/gioHangController");
+const cartController = require("../controllers/gioHangController");
+const protect = require("../middlewares/authMiddleware");
 
-const authMiddleware = require("../middlewares/authMiddleware");
-
-router.post("/", authMiddleware, createCart);
-router.post("/add", authMiddleware, addToCart);
-router.get("/", authMiddleware, getCart);
+router.post("/add", protect, cartController.addToCart);
+router.get("/", protect, cartController.getCart);
+router.put("/update/:id", protect, cartController.updateCartItem);
+router.delete("/remove/:id", protect, cartController.removeFromCart);
 
 module.exports = router;
+
+console.log("Giỏ hàng routes loaded");
