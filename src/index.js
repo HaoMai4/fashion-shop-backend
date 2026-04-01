@@ -41,7 +41,7 @@ app.get("/", (req, res) => {
 
 // 404 handler (optional nhưng nên có)
 app.use((req, res) => {
-  res.status(404).json({ message: "Route not found" });
+  res.status(404).json({ message: "Route not found", url: req.originalUrl });
 });
 
 // Start server

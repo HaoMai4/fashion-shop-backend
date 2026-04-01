@@ -8,3 +8,5 @@ router.put("/:id", dmController.updateDanhMuc);
 router.delete("/:id", dmController.deleteDanhMuc);
 
 module.exports = router;
+
+console.log("Danh mục routes loaded");

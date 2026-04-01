@@ -15,3 +15,5 @@ router.put("/:id", bienTheController.updateVariant);
 router.delete("/:id", bienTheController.deleteVariant);
 
 module.exports = router;
+
+console.log("Biến thể sản phẩm routes loaded");
