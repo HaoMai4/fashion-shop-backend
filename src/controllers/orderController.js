@@ -694,14 +694,58 @@ exports.getMyOrders = async (req, res) => {
   }
 };
 
+exports.getMyOrderByCode = async (req, res) => {
+  try {
+    const { orderCode } = req.params;
+    const userId = req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const order = await Order.findOne({
+      orderCode: String(orderCode).trim(),
+      userId,
+    })
+      .populate("items.productId", "name slug images")
+      .populate("items.variantId", "color colorCode sizes images sku")
+      .lean();
+
+    if (!order) {
+      return res.status(404).json({ message: "Không tìm thấy đơn hàng" });
+    }
+
+    return res.json({ data: order });
+  } catch (error) {
+    console.error("getMyOrderByCode error:", error);
+    return res.status(500).json({ message: "Không lấy được chi tiết đơn hàng" });
+  }
+};
+
 exports.getOrderById = async (req, res) => {
   try {
-    const order = await Order.findOne({ _id: req.params.id, userId: req.user.id });
-    if (!order) return res.status(404).json({ message: "Không tìm thấy đơn hàng" });
-    res.json(order);
+    const userId = req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const order = await Order.findOne({
+      _id: req.params.id,
+      userId,
+    })
+      .populate("items.productId", "name slug images")
+      .populate("items.variantId", "color colorCode sizes images sku")
+      .lean();
+
+    if (!order) {
+      return res.status(404).json({ message: "Không tìm thấy đơn hàng" });
+    }
+
+    return res.json({ data: order });
   } catch (error) {
     console.error("getOrderById error:", error);
-    res.status(500).json({ message: "Không lấy được đơn hàng" });
+    return res.status(500).json({ message: "Không lấy được đơn hàng" });
   }
 };
 
