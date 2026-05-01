@@ -1,4 +1,6 @@
+const mongoose = require("mongoose");
 const User = require("../models/User");
+const Product = require("../models/Product");
 const generateToken = require("../utils/generateToken");
 const { comparePassword, hashPassword } = require("../utils/hashPassword");
 const { generateOtp, saveOtp, verifyOtp } = require("../utils/otpService");
@@ -33,16 +35,40 @@ function sortAddresses(addresses) {
   return [...addresses].sort((a, b) => Number(b.isDefault) - Number(a.isDefault));
 }
 
+function getProductIdFromRequest(req) {
+  return req.params.productId || req.body.productId;
+}
+
+async function getPopulatedWishlist(userId) {
+  const user = await User.findById(userId)
+    .select("wishlist")
+    .populate({
+      path: "wishlist",
+      populate: { path: "variants" },
+    });
+
+  return user;
+}
+
 // =========================
 // Wishlist
 // =========================
 exports.addToWishlist = async (req, res) => {
   try {
     const userId = req.user.id;
-    const { productId } = req.body;
+    const productId = getProductIdFromRequest(req);
 
     if (!productId) {
       return res.status(400).json({ message: "Thiếu productId" });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(productId)) {
+      return res.status(400).json({ message: "productId không hợp lệ" });
+    }
+
+    const product = await Product.findById(productId).select("_id status");
+    if (!product) {
+      return res.status(404).json({ message: "Không tìm thấy sản phẩm" });
     }
 
     const user = await User.findById(userId);
@@ -50,27 +76,39 @@ exports.addToWishlist = async (req, res) => {
       return res.status(404).json({ message: "Không tìm thấy user" });
     }
 
-    if (user.wishlist.includes(productId)) {
-      return res.status(400).json({ message: "Sản phẩm đã có trong wishlist" });
+    const existed = user.wishlist.some(
+      (id) => id.toString() === productId.toString()
+    );
+
+    if (!existed) {
+      user.wishlist.push(productId);
+      await user.save();
     }
 
-    user.wishlist.push(productId);
-    await user.save();
+    const populatedUser = await getPopulatedWishlist(userId);
 
-    res.json({ message: "Đã thêm vào wishlist", wishlist: user.wishlist });
+    return res.json({
+      message: existed ? "Sản phẩm đã có trong wishlist" : "Đã thêm vào wishlist",
+      wishlist: populatedUser.wishlist,
+      data: populatedUser.wishlist,
+    });
   } catch (error) {
     console.error("addToWishlist error:", error);
-    res.status(500).json({ message: "Lỗi thêm wishlist" });
+    return res.status(500).json({ message: "Lỗi thêm wishlist" });
   }
 };
 
 exports.removeFromWishlist = async (req, res) => {
   try {
     const userId = req.user.id;
-    const { productId } = req.body;
+    const productId = getProductIdFromRequest(req);
 
     if (!productId) {
       return res.status(400).json({ message: "Thiếu productId" });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(productId)) {
+      return res.status(400).json({ message: "productId không hợp lệ" });
     }
 
     const user = await User.findById(userId);
@@ -84,10 +122,16 @@ exports.removeFromWishlist = async (req, res) => {
 
     await user.save();
 
-    res.json({ message: "Đã xóa khỏi wishlist", wishlist: user.wishlist });
+    const populatedUser = await getPopulatedWishlist(userId);
+
+    return res.json({
+      message: "Đã xóa khỏi wishlist",
+      wishlist: populatedUser.wishlist,
+      data: populatedUser.wishlist,
+    });
   } catch (error) {
     console.error("removeFromWishlist error:", error);
-    res.status(500).json({ message: "Lỗi xóa wishlist" });
+    return res.status(500).json({ message: "Lỗi xóa wishlist" });
   }
 };
 
@@ -95,19 +139,19 @@ exports.getWishlist = async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const user = await User.findById(userId).populate({
-      path: "wishlist",
-      populate: { path: "variants" },
-    });
+    const user = await getPopulatedWishlist(userId);
 
     if (!user) {
       return res.status(404).json({ message: "Không tìm thấy user" });
     }
 
-    res.json({ wishlist: user.wishlist });
+    return res.json({
+      wishlist: user.wishlist,
+      data: user.wishlist,
+    });
   } catch (error) {
     console.error("getWishlist error:", error);
-    res.status(500).json({ message: "Lỗi lấy wishlist" });
+    return res.status(500).json({ message: "Lỗi lấy wishlist" });
   }
 };
 
@@ -394,22 +438,58 @@ exports.getMe = async (req, res) => {
 
 exports.updateMe = async (req, res) => {
   try {
-    const updateFields = {
-      firstName: req.body.firstName,
-      lastName: req.body.lastName,
-      phone: req.body.phone,
-      gender: req.body.gender,
-      dateOfBirth: req.body.dateOfBirth,
-      avatar: req.body.avatar,
-    };
+    const allowedFields = [
+      "firstName",
+      "lastName",
+      "phone",
+      "gender",
+      "dateOfBirth",
+      "avatar",
+    ];
+
+    const updateFields = {};
+
+    allowedFields.forEach((field) => {
+      if (req.body[field] !== undefined) {
+        updateFields[field] = req.body[field];
+      }
+    });
+
+    if (updateFields.firstName !== undefined) {
+      updateFields.firstName = String(updateFields.firstName).trim();
+    }
+
+    if (updateFields.lastName !== undefined) {
+      updateFields.lastName = String(updateFields.lastName).trim();
+    }
+
+    if (updateFields.phone !== undefined) {
+      updateFields.phone = String(updateFields.phone).trim();
+    }
+
+    if (
+      updateFields.gender !== undefined &&
+      updateFields.gender !== "" &&
+      !["male", "female", "other", "nam", "nu", "khac"].includes(updateFields.gender)
+    ) {
+      return res.status(400).json({ message: "Giới tính không hợp lệ" });
+    }
 
     const user = await User.findByIdAndUpdate(
       req.user.id,
       { $set: updateFields },
-      { new: true }
+      { new: true, runValidators: true }
     ).select("-password");
 
-    res.json(user);
+    if (!user) {
+      return res.status(404).json({ message: "Không tìm thấy người dùng" });
+    }
+
+    res.json({
+      message: "Cập nhật thông tin thành công",
+      user,
+      data: user,
+    });
   } catch (error) {
     console.error("updateMe error:", error);
     res.status(500).json({ message: error.message });
