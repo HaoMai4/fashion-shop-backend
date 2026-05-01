@@ -8,30 +8,66 @@ const ProductRecentlyViewed = require('../models/ProductRecentlyViewed');
 
 exports.createProduct = async (req, res) => {
   try {
-    const { name, slug, shortDescription, brand, tags, categoryId } = req.body;
-    const category = await Category.findById(categoryId);
-    if (!category) {
-      return res.status(400).json({ message: "Danh mục không tồn tại" });
-    }
-    const product = new Product({
+    const {
       name,
       slug,
       shortDescription,
       brand,
       tags,
-      categoryId
+      categoryId,
+      gender,
+      material
+    } = req.body;
+
+    const category = await Category.findById(categoryId);
+    if (!category) {
+      return res.status(400).json({ message: "Danh mục không tồn tại" });
+    }
+
+    const normalizedGender = ["nam", "nu", "unisex"].includes(gender)
+      ? gender
+      : "unisex";
+
+    const product = new Product({
+      name,
+      slug,
+      shortDescription,
+      brand,
+      categoryId,
+      gender: normalizedGender,
+      material: material || "",
+      tags: Array.isArray(tags) ? tags : [],
     });
+
     await product.save();
-    res.status(201).json(product);
+
+    res.status(201).json({
+      message: "Tạo sản phẩm thành công",
+      data: product
+    });
   } catch (err) {
-    res.status(400).json({ message: "Không thể tạo sản phẩm", error: err.message });
+    res.status(400).json({
+      message: "Không thể tạo sản phẩm",
+      error: err.message
+    });
   }
 };
 
 
 exports.updateProduct = async (req, res) => {
   try {
-    const { categoryId } = req.body;
+    const {
+      name,
+      slug,
+      shortDescription,
+      brand,
+      tags,
+      categoryId,
+      status,
+      gender,
+      material
+    } = req.body;
+
     if (categoryId) {
       const category = await Category.findById(categoryId);
       if (!category) {
@@ -39,17 +75,44 @@ exports.updateProduct = async (req, res) => {
       }
     }
 
+    const updateData = {
+      updatedAt: new Date()
+    };
+
+    if (name !== undefined) updateData.name = name;
+    if (slug !== undefined) updateData.slug = slug;
+    if (shortDescription !== undefined) updateData.shortDescription = shortDescription;
+    if (brand !== undefined) updateData.brand = brand;
+    if (categoryId !== undefined) updateData.categoryId = categoryId;
+    if (Array.isArray(tags)) updateData.tags = tags;
+    if (status !== undefined) updateData.status = status;
+    if (material !== undefined) updateData.material = material;
+
+    if (gender !== undefined) {
+      updateData.gender = ["nam", "nu", "unisex"].includes(gender)
+        ? gender
+        : "unisex";
+    }
+
     const product = await Product.findByIdAndUpdate(
       req.params.id,
-      req.body,
+      { $set: updateData },
       { new: true }
     );
 
-    if (!product) return res.status(404).json({ message: "Không tìm thấy sản phẩm" });
+    if (!product) {
+      return res.status(404).json({ message: "Không tìm thấy sản phẩm" });
+    }
 
-    res.json(product);
+    res.json({
+      message: "Cập nhật sản phẩm thành công",
+      data: product
+    });
   } catch (err) {
-    res.status(400).json({ message: "Không thể cập nhật sản phẩm", error: err.message });
+    res.status(400).json({
+      message: "Không thể cập nhật sản phẩm",
+      error: err.message
+    });
   }
 };
 
