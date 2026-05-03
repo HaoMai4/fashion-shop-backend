@@ -42,6 +42,12 @@ router.post(
   reviewController.createOrUpdateReview
 );
 
+router.put(
+  "/reviews/:id",
+  authMiddleware,
+  reviewController.updateReview
+);
+
 router.delete(
   "/reviews/:id",
   authMiddleware,

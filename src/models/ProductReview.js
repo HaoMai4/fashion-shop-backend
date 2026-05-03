@@ -40,9 +40,8 @@ const productReviewSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Mỗi user chỉ có 1 review cho 1 sản phẩm.
-// Nếu user đánh giá lại, controller sẽ update review cũ.
-productReviewSchema.index({ productId: 1, userId: 1 }, { unique: true });
+// Không đặt unique index productId + userId.
+// Cho phép một user tạo nhiều review cho cùng một sản phẩm.
 
 // Sau khi tạo/cập nhật review, tính lại rating trung bình của sản phẩm.
 productReviewSchema.post("save", async function () {

@@ -31,7 +31,7 @@ async function recalculateProductRating(productId) {
   });
 }
 
-// Create or update a product review.
+// Create a new product review.
 // Current rule: only users who purchased the product in a completed order can review.
 exports.createOrUpdateReview = async (req, res) => {
   try {
@@ -91,33 +91,7 @@ exports.createOrUpdateReview = async (req, res) => {
       });
     }
 
-    let review = await ProductReview.findOne({
-      productId: pid,
-      userId,
-    });
-
-    if (review) {
-      review.rating = ratingNumber;
-
-      if (comment !== undefined) {
-        review.comment = comment;
-      }
-
-      await review.save();
-
-      const populatedReview = await ProductReview.findById(review._id)
-        .populate("userId", "firstName lastName avatar")
-        .populate("productId", "name slug")
-        .populate("adminReply.adminId", "firstName lastName avatar")
-        .lean();
-
-      return res.json({
-        message: "Review updated",
-        review: populatedReview,
-      });
-    }
-
-    review = new ProductReview({
+    const review = new ProductReview({
       productId: pid,
       userId,
       rating: ratingNumber,
@@ -139,11 +113,76 @@ exports.createOrUpdateReview = async (req, res) => {
   } catch (err) {
     console.error("createOrUpdateReview error", err);
 
-    if (err.code === 11000) {
-      return res.status(409).json({
-        message: "Bạn đã đánh giá sản phẩm này rồi.",
+    return res.status(500).json({
+      message: "Server error",
+      error: err.message,
+    });
+  }
+};
+
+// Update a specific review by review id.
+// Owner or admin can update.
+exports.updateReview = async (req, res) => {
+  try {
+    const user = req.user;
+
+    if (!user) {
+      return res.status(401).json({ message: "Auth required" });
+    }
+
+    const userId = getUserId(user);
+    const { id } = req.params;
+    const { rating, comment } = req.body || {};
+
+    if (!id) {
+      return res.status(400).json({ message: "review id required" });
+    }
+
+    const review = await ProductReview.findById(id);
+
+    if (!review) {
+      return res.status(404).json({ message: "Review not found" });
+    }
+
+    const isOwner = String(review.userId) === String(userId);
+    const isAdmin = user.role === "admin";
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ message: "Not allowed" });
+    }
+
+    const ratingNumber = Number(rating);
+
+    if (
+      !Number.isInteger(ratingNumber) ||
+      ratingNumber < 1 ||
+      ratingNumber > 5
+    ) {
+      return res.status(400).json({
+        message: "rating must be an integer between 1 and 5",
       });
     }
+
+    review.rating = ratingNumber;
+
+    if (comment !== undefined) {
+      review.comment = comment;
+    }
+
+    await review.save();
+
+    const populatedReview = await ProductReview.findById(review._id)
+      .populate("userId", "firstName lastName avatar")
+      .populate("productId", "name slug")
+      .populate("adminReply.adminId", "firstName lastName avatar")
+      .lean();
+
+    return res.json({
+      message: "Review updated",
+      review: populatedReview,
+    });
+  } catch (err) {
+    console.error("updateReview error", err);
 
     return res.status(500).json({
       message: "Server error",
