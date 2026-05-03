@@ -397,46 +397,140 @@ exports.getSalesByPeriod = async (req, res) => {
 
 exports.getTopProducts = async (req, res) => {
   try {
-    const limit = Math.min(100, parseInt(req.query.limit, 10) || 10);
-    const dateMatch = buildDateMatch(req.query, 90);
+    const limit = Math.min(50, parseInt(req.query.limit, 10) || 10);
 
-    const rows = await Order.aggregate([
-      {
-        $match: {
-          createdAt: dateMatch.createdAt,
-          "paymentMethod.status": "paid",
-        },
-      },
-      { $unwind: "$items" },
-      {
-        $group: {
-          _id: "$items.productId",
-          productName: { $first: "$items.name" },
-          productCode: { $first: "$items.productId" },
-          qtySold: { $sum: "$items.quantity" },
-          revenue: {
-            $sum: {
-              $multiply: ["$items.quantity", "$items.price"],
-            },
-          },
-        },
-      },
-      { $sort: { qtySold: -1, revenue: -1 } },
-      { $limit: limit },
-    ]);
+    const orderMatch = {
+      "paymentMethod.status": "paid",
+    };
+
+    if (req.query.startDate || req.query.endDate) {
+      orderMatch.createdAt = {};
+
+      if (req.query.startDate) {
+        const start = new Date(req.query.startDate);
+        start.setHours(0, 0, 0, 0);
+        orderMatch.createdAt.$gte = start;
+      }
+
+      if (req.query.endDate) {
+        const end = new Date(req.query.endDate);
+        end.setHours(23, 59, 59, 999);
+        orderMatch.createdAt.$lte = end;
+      }
+    } else {
+      const periodDays = Math.max(
+        1,
+        parseInt(req.query.periodDays, 10) || 90
+      );
+
+      const since = new Date();
+      since.setDate(since.getDate() - periodDays);
+      since.setHours(0, 0, 0, 0);
+
+      const now = new Date();
+      now.setHours(23, 59, 59, 999);
+
+      orderMatch.createdAt = {
+        $gte: since,
+        $lte: now,
+      };
+    }
+
+    const orders = await Order.find(orderMatch)
+      .populate("items.productId", "name slug")
+      .populate("items.variantId", "color colorCode")
+      .lean();
+
+    const map = new Map();
+
+    for (const order of orders) {
+      for (const item of order.items || []) {
+        const product = item.productId;
+        const variant = item.variantId;
+
+        const productId = product?._id || item.productId;
+        const variantId = variant?._id || item.variantId || null;
+
+        if (!productId) continue;
+
+        const productName =
+          product?.name ||
+          item.productName ||
+          item.name ||
+          item.ten ||
+          "Không rõ sản phẩm";
+
+        const color =
+          item.color ||
+          item.colorName ||
+          item.mauSac ||
+          item.selectedColor ||
+          variant?.color ||
+          "Không rõ màu";
+
+        const colorCode =
+          item.colorCode ||
+          item.maMau ||
+          variant?.colorCode ||
+          "#000000";
+
+        const size =
+          item.size ||
+          item.kichCo ||
+          item.selectedSize ||
+          "Không rõ size";
+
+        const quantity = Number(item.quantity || item.soLuong || 0);
+        const price = Number(
+          item.finalPrice ||
+          item.price ||
+          item.gia ||
+          item.discountPrice ||
+          0
+        );
+
+        if (quantity <= 0) continue;
+
+        const key = `${String(productId)}-${String(variantId || "no-variant")}-${String(size)}`;
+
+        const current = map.get(key) || {
+          _id: key,
+          productId,
+          variantId,
+          productName,
+          color,
+          colorCode,
+          size,
+          qtySold: 0,
+          revenue: 0,
+        };
+
+        current.qtySold += quantity;
+        current.revenue += quantity * price;
+
+        map.set(key, current);
+      }
+    }
+
+    const data = Array.from(map.values())
+      .sort((a, b) => b.qtySold - a.qtySold || b.revenue - a.revenue)
+      .slice(0, limit);
 
     return res.json({
-      periodDays: dateMatch.periodDays || null,
+      periodDays: req.query.periodDays ? Number(req.query.periodDays) : null,
       limit,
-      data: rows,
+      data,
     });
   } catch (err) {
     console.error("getTopProducts error:", err);
-    return res.status(500).json({ message: "Lỗi khi lấy top sản phẩm" });
+    return res.status(500).json({
+      message: "Lỗi khi lấy top sản phẩm bán chạy",
+      error: err.message,
+    });
   }
 };
 
-exports.getSlowestProducts = async (req, res) => {
+exports.getSlowProducts = async (req, res) => {
   try {
     const limit = Math.min(200, parseInt(req.query.limit, 10) || 20);
     const dateMatch = buildDateMatch(req.query, 90);
@@ -547,336 +641,448 @@ exports.getTopCustomers = async (req, res) => {
         $match: {
           createdAt: dateMatch.createdAt,
           "paymentMethod.status": "paid",
-          userId: { $ne: null },
         },
       },
       {
         $group: {
-          _id: "$userId",
-          totalSpent: { $sum: "$totalAmount" },
+          _id: {
+            $ifNull: ["$userId", "$guestInfo.email"],
+          },
           orders: { $sum: 1 },
-        },
-      },
-      { $sort: { totalSpent: -1 } },
-      { $limit: limit },
-      {
-        $lookup: {
-          from: "users",
-          localField: "_id",
-          foreignField: "_id",
-          as: "user",
-        },
-      },
-      {
-        $unwind: {
-          path: "$user",
-          preserveNullAndEmptyArrays: true,
-        },
-      },
-      {
-        $project: {
-          userId: "$_id",
+          totalSpent: { $sum: "$totalAmount" },
           name: {
-            $trim: {
-              input: {
-                $concat: [
-                  { $ifNull: ["$user.firstName", ""] },
-                  " ",
-                  { $ifNull: ["$user.lastName", ""] },
-                ],
-              },
+            $first: {
+              $ifNull: ["$shippingAddress.fullName", "$guestInfo.fullName"],
             },
           },
-          email: "$user.email",
-          phone: "$user.phone",
-          totalSpent: 1,
-          orders: 1,
+          email: {
+            $first: {
+              $ifNull: ["$guestInfo.email", "$shippingAddress.email"],
+            },
+          },
+          phone: {
+            $first: {
+              $ifNull: ["$shippingAddress.phone", "$guestInfo.phone"],
+            },
+          },
         },
       },
-    ]);
-
-    const topGuests = await Order.aggregate([
-      {
-        $match: {
-          createdAt: dateMatch.createdAt,
-          "paymentMethod.status": "paid",
-          userId: null,
-          "guestInfo.email": { $exists: true, $ne: "" },
-        },
-      },
-      {
-        $group: {
-          _id: "$guestInfo.email",
-          totalSpent: { $sum: "$totalAmount" },
-          orders: { $sum: 1 },
-        },
-      },
-      { $sort: { totalSpent: -1 } },
+      { $sort: { totalSpent: -1, orders: -1 } },
       { $limit: limit },
     ]);
 
-    const combined = [];
-    let rank = 1;
-
-    for (const user of topUsers) {
-      combined.push({
-        rank: rank++,
-        name: user.name || user.email || "",
-        email: user.email || "",
-        phone: user.phone || "",
-        orders: user.orders || 0,
-        totalSpent: user.totalSpent || 0,
-        userId: user.userId,
-      });
-    }
-
-    for (const guest of topGuests) {
-      combined.push({
-        rank: rank++,
-        name: guest._id || "",
-        email: guest._id || "",
-        phone: "",
-        orders: guest.orders || 0,
-        totalSpent: guest.totalSpent || 0,
-      });
-    }
+    const data = topUsers.map((item, index) => ({
+      rank: index + 1,
+      userId:
+        item._id && mongoose.Types.ObjectId.isValid(String(item._id))
+          ? String(item._id)
+          : null,
+      name: item.name || "Khách hàng",
+      email: item.email || "",
+      phone: item.phone || "",
+      orders: item.orders || 0,
+      totalSpent: item.totalSpent || 0,
+    }));
 
     return res.json({
       periodDays: dateMatch.periodDays || null,
       limit,
-      data: combined,
+      data,
     });
   } catch (err) {
     console.error("getTopCustomers error:", err);
     return res.status(500).json({ message: "Lỗi khi lấy top khách hàng" });
   }
 };
-
-exports.getRevenueForecast = async (req, res) => {
+exports.getForecast = async (req, res) => {
   try {
-    const period = req.query.period || null;
-    const limit = Math.max(1, parseInt(req.query.limit, 10) || 1);
+    const days = Math.max(1, parseInt(req.query.days, 10) || 7);
+    const dateMatch = buildDateMatch(req.query, 30);
 
-    const db = mongoose.connection.db;
-    const collection = db.collection("revenue_forecasts");
-
-    const query = {};
-    if (period) query.period = period;
-
-    const docs = await collection.find(query).sort({ createdAt: -1 }).limit(limit).toArray();
-
-    if (!docs || docs.length === 0) {
-      return res.status(404).json({ message: "No forecast found" });
-    }
-
-    if (limit === 1) return res.json(docs[0]);
-    return res.json(docs);
-  } catch (err) {
-    console.error("getRevenueForecast error:", err);
-    return res.status(500).json({ message: "Lỗi khi lấy forecast" });
-  }
-};
-
-exports.exportStatsExcel = async (req, res) => {
-  try {
-    const workbook = new ExcelJS.Workbook();
-    workbook.created = new Date();
-
-    const dateMatch = buildDateMatch(req.query, 90);
-    const salesRange = getSalesDateRange(req.query);
-
-    const overviewRes = await new Promise((resolve, reject) => {
-      const fakeRes = {
-        json: resolve,
-        status: () => ({
-          json: reject,
-        }),
-      };
-
-      exports.getAdminStats(req, fakeRes).catch(reject);
-    });
-
-    const topProductsRows = await Order.aggregate([
+    const rows = await Order.aggregate([
       {
         $match: {
           createdAt: dateMatch.createdAt,
           "paymentMethod.status": "paid",
         },
       },
-      { $unwind: "$items" },
       {
         $group: {
-          _id: "$items.productId",
-          productName: { $first: "$items.name" },
-          qtySold: { $sum: "$items.quantity" },
-          revenue: {
-            $sum: {
-              $multiply: ["$items.quantity", "$items.price"],
-            },
+          _id: {
+            year: { $year: "$createdAt" },
+            month: { $month: "$createdAt" },
+            day: { $dayOfMonth: "$createdAt" },
           },
+          orders: { $sum: 1 },
+          revenue: { $sum: "$totalAmount" },
         },
       },
-      { $sort: { qtySold: -1, revenue: -1 } },
-      { $limit: 50 },
+      { $sort: { "_id.year": 1, "_id.month": 1, "_id.day": 1 } },
     ]);
+
+    const totalRevenue = rows.reduce((sum, item) => sum + (item.revenue || 0), 0);
+    const totalOrders = rows.reduce((sum, item) => sum + (item.orders || 0), 0);
+    const activeDays = Math.max(1, rows.length);
+
+    const avgDailyRevenue = totalRevenue / activeDays;
+    const avgDailyOrders = totalOrders / activeDays;
+
+    const forecast = Array.from({ length: days }).map((_, index) => {
+      const date = new Date();
+      date.setDate(date.getDate() + index + 1);
+
+      return {
+        date: date.toISOString().slice(0, 10),
+        expectedRevenue: Math.round(avgDailyRevenue),
+        expectedOrders: Math.round(avgDailyOrders),
+      };
+    });
+
+    return res.json({
+      days,
+      avgDailyRevenue,
+      avgDailyOrders,
+      forecast,
+    });
+  } catch (err) {
+    console.error("getForecast error:", err);
+    return res.status(500).json({ message: "Lỗi khi dự báo doanh thu" });
+  }
+};
+
+exports.exportStatsToExcel = async (req, res) => {
+  try {
+    const dateMatch = buildDateMatch(req.query, 90);
+
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = "StyleHub";
+    workbook.created = new Date();
+
+    const overviewSheet = workbook.addWorksheet("Tong quan");
+    overviewSheet.columns = [
+      { header: "Chi so", key: "label", width: 32 },
+      { header: "Gia tri", key: "value", width: 22 },
+    ];
+
+    const [overview] = await Order.aggregate([
+      {
+        $match: {
+          createdAt: dateMatch.createdAt,
+        },
+      },
+      {
+        $facet: {
+          totals: [
+            {
+              $group: {
+                _id: null,
+                totalOrders: { $sum: 1 },
+                totalRevenueAll: { $sum: "$totalAmount" },
+                totalPaidRevenue: {
+                  $sum: {
+                    $cond: [
+                      { $eq: ["$paymentMethod.status", "paid"] },
+                      "$totalAmount",
+                      0,
+                    ],
+                  },
+                },
+                totalPaidOrders: {
+                  $sum: {
+                    $cond: [{ $eq: ["$paymentMethod.status", "paid"] }, 1, 0],
+                  },
+                },
+              },
+            },
+          ],
+          uniqueCustomers: [
+            {
+              $group: {
+                _id: {
+                  $ifNull: ["$userId", "$guestInfo.email"],
+                },
+              },
+            },
+            { $group: { _id: null, count: { $sum: 1 } } },
+          ],
+        },
+      },
+    ]);
+
+    const totals = overview?.totals?.[0] || {};
+    overviewSheet.addRows([
+      { label: "Tong don hang", value: totals.totalOrders || 0 },
+      { label: "Tong doanh thu", value: totals.totalRevenueAll || 0 },
+      { label: "Doanh thu da thanh toan", value: totals.totalPaidRevenue || 0 },
+      { label: "Don da thanh toan", value: totals.totalPaidOrders || 0 },
+      { label: "Khach hang", value: overview?.uniqueCustomers?.[0]?.count || 0 },
+      {
+        label: "Tu ngay",
+        value: dateMatch.startDate ? dateMatch.startDate.toISOString().slice(0, 10) : "",
+      },
+      {
+        label: "Den ngay",
+        value: dateMatch.endDate ? dateMatch.endDate.toISOString().slice(0, 10) : "",
+      },
+    ]);
+
+    const salesSheet = workbook.addWorksheet("Doanh thu");
+    salesSheet.columns = [
+      { header: "Ngay", key: "label", width: 18 },
+      { header: "So don", key: "orders", width: 14 },
+      { header: "Doanh thu", key: "revenue", width: 20 },
+    ];
 
     const salesRows = await Order.aggregate([
       {
         $match: {
-          createdAt: {
-            $gte: salesRange.startDate,
-            $lte: salesRange.endDate,
-          },
+          createdAt: dateMatch.createdAt,
           "paymentMethod.status": "paid",
         },
       },
       {
         $group: {
-          _id: getGroupId(salesRange.period),
+          _id: {
+            year: { $year: "$createdAt" },
+            month: { $month: "$createdAt" },
+            day: { $dayOfMonth: "$createdAt" },
+          },
           orders: { $sum: 1 },
           revenue: { $sum: "$totalAmount" },
         },
       },
-      { $sort: { "_id.year": 1, "_id.month": 1, "_id.week": 1, "_id.day": 1 } },
+      { $sort: { "_id.year": 1, "_id.month": 1, "_id.day": 1 } },
     ]);
 
-    const salesMap = {};
-    for (const row of salesRows) {
-      salesMap[getRowKey(row, salesRange.period)] = {
-        orders: row.orders,
-        revenue: row.revenue,
-      };
-    }
-
-    const salesLabels = buildLabels(
-      salesRange.period,
-      salesRange.startDate,
-      salesRange.endDate
+    salesSheet.addRows(
+      salesRows.map((item) => ({
+        label: `${item._id.year}-${String(item._id.month).padStart(2, "0")}-${String(
+          item._id.day
+        ).padStart(2, "0")}`,
+        orders: item.orders || 0,
+        revenue: item.revenue || 0,
+      }))
     );
 
-    const overviewSheet = workbook.addWorksheet("Tổng quan");
-    overviewSheet.columns = [
-      { header: "Chỉ số", width: 36 },
-      { header: "Giá trị", width: 24 },
-    ];
-
-    overviewSheet.addRow(["Chỉ số", "Giá trị"]);
-    overviewSheet.addRow(["Tổng đơn hàng", overviewRes.totalOrders || 0]);
-    overviewSheet.addRow(["Tổng doanh thu", overviewRes.totalRevenueAll || 0]);
-    overviewSheet.addRow(["Doanh thu đã thanh toán", overviewRes.totalPaidRevenue || 0]);
-    overviewSheet.addRow(["Đơn đã thanh toán", overviewRes.totalPaidOrders || 0]);
-    overviewSheet.addRow(["Khách hàng", overviewRes.uniqueCustomers || 0]);
-
-    overviewSheet.addRow([]);
-    overviewSheet.addRow(["Đơn theo trạng thái", "Số lượng"]);
-
-    Object.entries(overviewRes.statusCounts || {}).forEach(([status, count]) => {
-      overviewSheet.addRow([getStatusLabel(status), count]);
-    });
-
-    overviewSheet.addRow([]);
-    overviewSheet.addRow(["Thanh toán", "Số lượng"]);
-
-    Object.entries(overviewRes.paymentCounts || {}).forEach(([status, count]) => {
-      overviewSheet.addRow([getPaymentLabel(status), count]);
-    });
-
-    overviewSheet.eachRow((row, rowNumber) => {
-      row.eachCell((cell) => {
-        cell.border = {
-          top: { style: "thin" },
-          left: { style: "thin" },
-          bottom: { style: "thin" },
-          right: { style: "thin" },
-        };
-
-        if (typeof cell.value === "number" && rowNumber >= 3) {
-          cell.numFmt = '#,##0';
-        }
-      });
-    });
-
-    overviewSheet.getRow(1).font = { bold: true };
-
-    const salesSheet = workbook.addWorksheet("Doanh thu");
-    salesSheet.columns = [
-      { header: "Mốc thời gian", width: 22 },
-      { header: "Số đơn", width: 14 },
-      { header: "Doanh thu", width: 20 },
-    ];
-
-    salesSheet.addRow(["Mốc thời gian", "Số đơn", "Doanh thu"]);
-
-    salesLabels.forEach((label) => {
-      const row = salesMap[label] || { orders: 0, revenue: 0 };
-      salesSheet.addRow([label, row.orders, row.revenue]);
-    });
-
-    salesSheet.eachRow((row, rowNumber) => {
-      row.eachCell((cell) => {
-        cell.border = {
-          top: { style: "thin" },
-          left: { style: "thin" },
-          bottom: { style: "thin" },
-          right: { style: "thin" },
-        };
-
-        if (rowNumber > 1 && typeof row.getCell(3).value === "number") {
-          row.getCell(3).numFmt = '#,##0 "₫"';
-        }
-      });
-    });
-
-    salesSheet.getRow(1).font = { bold: true };
-
-    const topProductsSheet = workbook.addWorksheet("Sản phẩm bán chạy");
+    const topProductsSheet = workbook.addWorksheet("Top san pham");
     topProductsSheet.columns = [
-      { header: "Hạng", width: 8 },
-      { header: "Sản phẩm", width: 50 },
-      { header: "Đã bán", width: 14 },
-      { header: "Doanh thu", width: 20 },
+      { header: "San pham", key: "productName", width: 36 },
+      { header: "Mau", key: "color", width: 18 },
+      { header: "Size", key: "size", width: 14 },
+      { header: "Da ban", key: "qtySold", width: 14 },
+      { header: "Doanh thu", key: "revenue", width: 20 },
     ];
 
-    topProductsSheet.addRow(["Hạng", "Sản phẩm", "Đã bán", "Doanh thu"]);
+    const fakeReq = {
+      query: {
+        ...req.query,
+        limit: 50,
+      },
+    };
 
-    topProductsRows.forEach((item, index) => {
-      topProductsSheet.addRow([
-        index + 1,
-        item.productName || "Không rõ",
-        item.qtySold || 0,
-        item.revenue || 0,
-      ]);
+    const topProductRows = await getTopProductRowsForExport(fakeReq.query);
+
+    topProductsSheet.addRows(
+      topProductRows.map((item) => ({
+        productName: item.productName || "Khong ro",
+        color: item.color || "Khong ro mau",
+        size: item.size || "Khong ro size",
+        qtySold: item.qtySold || 0,
+        revenue: item.revenue || 0,
+      }))
+    );
+
+    const customersSheet = workbook.addWorksheet("Top khach hang");
+    customersSheet.columns = [
+      { header: "Hang", key: "rank", width: 10 },
+      { header: "Khach hang", key: "name", width: 28 },
+      { header: "Email", key: "email", width: 32 },
+      { header: "So dien thoai", key: "phone", width: 18 },
+      { header: "So don", key: "orders", width: 14 },
+      { header: "Tong chi", key: "totalSpent", width: 20 },
+    ];
+
+    const topUsers = await Order.aggregate([
+      {
+        $match: {
+          createdAt: dateMatch.createdAt,
+          "paymentMethod.status": "paid",
+        },
+      },
+      {
+        $group: {
+          _id: {
+            $ifNull: ["$userId", "$guestInfo.email"],
+          },
+          orders: { $sum: 1 },
+          totalSpent: { $sum: "$totalAmount" },
+          name: {
+            $first: {
+              $ifNull: ["$shippingAddress.fullName", "$guestInfo.fullName"],
+            },
+          },
+          email: {
+            $first: {
+              $ifNull: ["$guestInfo.email", "$shippingAddress.email"],
+            },
+          },
+          phone: {
+            $first: {
+              $ifNull: ["$shippingAddress.phone", "$guestInfo.phone"],
+            },
+          },
+        },
+      },
+      { $sort: { totalSpent: -1, orders: -1 } },
+      { $limit: 50 },
+    ]);
+
+    customersSheet.addRows(
+      topUsers.map((item, index) => ({
+        rank: index + 1,
+        name: item.name || "Khach hang",
+        email: item.email || "",
+        phone: item.phone || "",
+        orders: item.orders || 0,
+        totalSpent: item.totalSpent || 0,
+      }))
+    );
+
+    [overviewSheet, salesSheet, topProductsSheet, customersSheet].forEach((sheet) => {
+      sheet.getRow(1).font = { bold: true };
+      sheet.getRow(1).alignment = { vertical: "middle" };
     });
-
-    topProductsSheet.eachRow((row, rowNumber) => {
-      row.eachCell((cell) => {
-        cell.border = {
-          top: { style: "thin" },
-          left: { style: "thin" },
-          bottom: { style: "thin" },
-          right: { style: "thin" },
-        };
-
-        if (rowNumber > 1 && typeof row.getCell(4).value === "number") {
-          row.getCell(4).numFmt = '#,##0 "₫"';
-        }
-      });
-    });
-
-    topProductsSheet.getRow(1).font = { bold: true };
-
-    const buffer = await workbook.xlsx.writeBuffer();
-    const filename = `thongke_${new Date().toISOString().slice(0, 10)}.xlsx`;
 
     res.setHeader(
       "Content-Type",
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     );
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Content-Disposition", "attachment; filename=stylehub-stats.xlsx");
 
-    return res.send(Buffer.from(buffer));
+    await workbook.xlsx.write(res);
+    return res.end();
   } catch (err) {
-    console.error("exportStatsExcel error:", err);
-    return res.status(500).json({ message: "Lỗi khi xuất Excel" });
+    console.error("exportStatsToExcel error:", err);
+    return res.status(500).json({
+      message: "Lỗi khi xuất Excel",
+      error: err.message,
+    });
   }
 };
+
+async function getTopProductRowsForExport(query) {
+  const limit = Math.min(100, parseInt(query.limit, 10) || 50);
+
+  const orderMatch = {
+    "paymentMethod.status": "paid",
+  };
+
+  if (query.startDate || query.endDate) {
+    orderMatch.createdAt = {};
+
+    if (query.startDate) {
+      const start = new Date(query.startDate);
+      start.setHours(0, 0, 0, 0);
+      orderMatch.createdAt.$gte = start;
+    }
+
+    if (query.endDate) {
+      const end = new Date(query.endDate);
+      end.setHours(23, 59, 59, 999);
+      orderMatch.createdAt.$lte = end;
+    }
+  } else {
+    const periodDays = Math.max(1, parseInt(query.periodDays, 10) || 90);
+    const since = new Date();
+    since.setDate(since.getDate() - periodDays);
+    since.setHours(0, 0, 0, 0);
+
+    const now = new Date();
+    now.setHours(23, 59, 59, 999);
+
+    orderMatch.createdAt = {
+      $gte: since,
+      $lte: now,
+    };
+  }
+
+  const orders = await Order.find(orderMatch)
+    .populate("items.productId", "name slug")
+    .populate("items.variantId", "color colorCode")
+    .lean();
+
+  const map = new Map();
+
+  for (const order of orders) {
+    for (const item of order.items || []) {
+      const product = item.productId;
+      const variant = item.variantId;
+
+      const productId = product?._id || item.productId;
+      const variantId = variant?._id || item.variantId || null;
+
+      if (!productId) continue;
+
+      const productName =
+        product?.name ||
+        item.productName ||
+        item.name ||
+        item.ten ||
+        "Không rõ sản phẩm";
+
+      const color =
+        item.color ||
+        item.colorName ||
+        item.mauSac ||
+        item.selectedColor ||
+        variant?.color ||
+        "Không rõ màu";
+
+      const colorCode =
+        item.colorCode ||
+        item.maMau ||
+        variant?.colorCode ||
+        "#000000";
+
+      const size =
+        item.size ||
+        item.kichCo ||
+        item.selectedSize ||
+        "Không rõ size";
+
+      const quantity = Number(item.quantity || item.soLuong || 0);
+      const price = Number(
+        item.finalPrice ||
+        item.price ||
+        item.gia ||
+        item.discountPrice ||
+        0
+      );
+
+      if (quantity <= 0) continue;
+
+      const key = `${String(productId)}-${String(variantId || "no-variant")}-${String(size)}`;
+
+      const current = map.get(key) || {
+        _id: key,
+        productId,
+        variantId,
+        productName,
+        color,
+        colorCode,
+        size,
+        qtySold: 0,
+        revenue: 0,
+      };
+
+      current.qtySold += quantity;
+      current.revenue += quantity * price;
+
+      map.set(key, current);
+    }
+  }
+
+  return Array.from(map.values())
+    .sort((a, b) => b.qtySold - a.qtySold || b.revenue - a.revenue)
+    .slice(0, limit);
+}

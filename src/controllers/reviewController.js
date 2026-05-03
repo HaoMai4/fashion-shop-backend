@@ -77,25 +77,75 @@ exports.createOrUpdateReview = async (req, res) => {
       });
     }
 
-    const completedStatuses = ["hoan_thanh", "completed", "delivered"];
-
-    const hasPurchased = await Order.exists({
+    const completedOrder = await Order.findOne({
       userId,
-      orderStatus: { $in: completedStatuses },
+      orderStatus: {
+        $in: [
+          "delivered",
+          "completed",
+          "da_giao",
+          "hoan_thanh",
+        ],
+      },
       "items.productId": pid,
-    });
+    })
+      .sort({ createdAt: -1 })
+      .populate("items.variantId", "color colorCode")
+      .lean();
 
-    if (!hasPurchased) {
+    if (!completedOrder) {
       return res.status(403).json({
-        message: "Bạn chỉ có thể đánh giá sản phẩm đã mua và đã hoàn thành.",
+        message: "Bạn chỉ có thể đánh giá sản phẩm đã mua và đã hoàn thành",
       });
     }
+
+    const purchasedItem = (completedOrder.items || []).find((item) => {
+      const itemProductId = item.productId?._id || item.productId;
+      return String(itemProductId) === String(pid);
+    });
+
+    if (!purchasedItem) {
+      return res.status(403).json({
+        message: "Không tìm thấy sản phẩm đã mua trong đơn hàng",
+      });
+    }
+
+    const purchasedVariant = purchasedItem.variantId;
+
+    const reviewVariantId =
+      purchasedVariant?._id ||
+      purchasedItem.variantId ||
+      null;
+
+    const reviewColor =
+      purchasedItem.color ||
+      purchasedItem.colorName ||
+      purchasedItem.mauSac ||
+      purchasedItem.selectedColor ||
+      purchasedVariant?.color ||
+      "";
+
+    const reviewColorCode =
+      purchasedItem.colorCode ||
+      purchasedItem.maMau ||
+      purchasedVariant?.colorCode ||
+      "";
+
+    const reviewSize =
+      purchasedItem.size ||
+      purchasedItem.kichCo ||
+      purchasedItem.selectedSize ||
+      "";
 
     const review = new ProductReview({
       productId: pid,
       userId,
+      variantId: reviewVariantId,
+      color: reviewColor,
+      colorCode: reviewColorCode,
+      size: reviewSize,
       rating: ratingNumber,
-      comment: comment || "",
+      comment,
     });
 
     await review.save();
@@ -420,22 +470,26 @@ exports.getLatestFiveCustomerReviews = async (req, res) => {
         user: review.userId || null,
         rating: review.rating,
         comment: review.comment,
+        variantId: review.variantId || null,
+        color: review.color || "",
+        colorCode: review.colorCode || "",
+        size: review.size || "",
         createdAt: review.createdAt,
         adminReply: review.adminReply
           ? {
-              message: review.adminReply.message || null,
-              repliedAt: review.adminReply.repliedAt || null,
-              admin: review.adminReply.adminId
-                ? {
-                    _id:
-                      review.adminReply.adminId._id ||
-                      review.adminReply.adminId,
-                    firstName: review.adminReply.adminId.firstName,
-                    lastName: review.adminReply.adminId.lastName,
-                    avatar: review.adminReply.adminId.avatar,
-                  }
-                : null,
-            }
+            message: review.adminReply.message || null,
+            repliedAt: review.adminReply.repliedAt || null,
+            admin: review.adminReply.adminId
+              ? {
+                _id:
+                  review.adminReply.adminId._id ||
+                  review.adminReply.adminId,
+                firstName: review.adminReply.adminId.firstName,
+                lastName: review.adminReply.adminId.lastName,
+                avatar: review.adminReply.adminId.avatar,
+              }
+              : null,
+          }
           : null,
       });
 

@@ -17,6 +17,72 @@ async function recalcVariantStatus(variantId) {
   return ProductVariant.findByIdAndUpdate(variantId, { status }, { new: true });
 }
 
+function normalizeSkuPart(value, fallback = "NA") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/đ/g, "d")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)+/g, "");
+
+  return normalized ? normalized.toUpperCase() : fallback;
+}
+
+function shortRandomCode(length = 4) {
+  return Math.random().toString(36).slice(2, 2 + length).toUpperCase();
+}
+
+async function generateSku({ productId, color, size }) {
+  const product = await Product.findById(productId).select("name slug").lean();
+
+  const productPart = normalizeSkuPart(product?.slug || product?.name || "SP")
+    .split("-")
+    .map((part) => part.slice(0, 4))
+    .join("")
+    .slice(0, 14);
+
+  const colorPart = normalizeSkuPart(color || "COLOR").slice(0, 8);
+  const sizePart = normalizeSkuPart(size || "SIZE").slice(0, 6);
+
+  let sku = "";
+  let existed = true;
+
+  while (existed) {
+    sku = `SH-${productPart}-${colorPart}-${sizePart}-${shortRandomCode()}`;
+    existed = await ProductVariant.exists({ "sizes.sku": sku });
+  }
+
+  return sku;
+}
+
+async function normalizeSizesWithSku({ sizesArray, productId, color }) {
+  const result = [];
+
+  for (const item of sizesArray || []) {
+    const sizeItem = { ...item };
+
+    if (!sizeItem.size || !String(sizeItem.size).trim()) {
+      continue;
+    }
+
+    if (!sizeItem.sku || !String(sizeItem.sku).trim()) {
+      sizeItem.sku = await generateSku({
+        productId,
+        color,
+        size: sizeItem.size,
+      });
+    } else {
+      sizeItem.sku = String(sizeItem.sku).trim().toUpperCase();
+    }
+
+    result.push(sizeItem);
+  }
+
+  return result;
+}
+
 exports.createVariant = async (req, res) => {
   try {
     const {
@@ -46,6 +112,29 @@ exports.createVariant = async (req, res) => {
           error: parseError.message,
         });
       }
+    }
+
+    sizesArray = await normalizeSizesWithSku({
+      sizesArray,
+      productId,
+      color,
+    });
+
+    const duplicatedSize = new Set();
+    for (const item of sizesArray) {
+      const sizeKey = String(item.size || "").trim().toLowerCase();
+
+      if (!sizeKey) {
+        return res.status(400).json({ message: "Size không hợp lệ" });
+      }
+
+      if (duplicatedSize.has(sizeKey)) {
+        return res.status(400).json({
+          message: `Size ${item.size} bị trùng trong cùng một biến thể`,
+        });
+      }
+
+      duplicatedSize.add(sizeKey);
     }
 
     const imageUrls = [];
@@ -142,14 +231,40 @@ exports.addSizeToVariant = async (req, res) => {
       return res.status(404).json({ message: "Variant not found" });
     }
 
-    if (
-      variant.sizes.some(
-        (s) => s.size === sizeData.size && s.sku === sizeData.sku
-      )
-    ) {
-      return res
-        .status(400)
-        .json({ message: "This size+sku already exists for this variant" });
+    if (!sizeData.size || !String(sizeData.size).trim()) {
+      return res.status(400).json({ message: "Vui lòng nhập size" });
+    }
+
+    const normalizedSize = String(sizeData.size).trim().toLowerCase();
+
+    const existedSize = variant.sizes.some(
+      (s) => String(s.size || "").trim().toLowerCase() === normalizedSize
+    );
+
+    if (existedSize) {
+      return res.status(400).json({
+        message: `Size ${sizeData.size} đã tồn tại trong biến thể này`,
+      });
+    }
+
+    if (!sizeData.sku || !String(sizeData.sku).trim()) {
+      sizeData.sku = await generateSku({
+        productId: variant.productId,
+        color: variant.color,
+        size: sizeData.size,
+      });
+    } else {
+      sizeData.sku = String(sizeData.sku).trim().toUpperCase();
+
+      const existedSku = await ProductVariant.exists({
+        "sizes.sku": sizeData.sku,
+      });
+
+      if (existedSku) {
+        return res.status(400).json({
+          message: "SKU đã tồn tại trong hệ thống",
+        });
+      }
     }
 
     variant.sizes.push(sizeData);
@@ -166,6 +281,44 @@ exports.addSizeToVariant = async (req, res) => {
 exports.updateSizeInVariant = async (req, res) => {
   try {
     const { variantId, sizeId } = req.params;
+
+    const variant = await ProductVariant.findById(variantId);
+    if (!variant) {
+      return res.status(404).json({ message: "Variant not found" });
+    }
+
+    const currentSize = variant.sizes.id(sizeId);
+    if (!currentSize) {
+      return res.status(404).json({ message: "Size not found" });
+    }
+
+    if (req.body.size !== undefined) {
+      const nextSize = String(req.body.size || "").trim().toLowerCase();
+
+      if (!nextSize) {
+        return res.status(400).json({ message: "Size không hợp lệ" });
+      }
+
+      const existedSize = variant.sizes.some((item) => {
+        const sameSize = String(item.size || "").trim().toLowerCase() === nextSize;
+        const differentRow = String(item._id) !== String(sizeId);
+        return sameSize && differentRow;
+      });
+
+      if (existedSize) {
+        return res.status(400).json({
+          message: `Size ${req.body.size} đã tồn tại trong biến thể này`,
+        });
+      }
+    }
+
+    if (!req.body.sku && !currentSize.sku) {
+      req.body.sku = await generateSku({
+        productId: variant.productId,
+        color: variant.color,
+        size: req.body.size || currentSize.size,
+      });
+    }
 
     const allowed = [
       "size",
@@ -387,17 +540,41 @@ exports.updateVariant = async (req, res) => {
       console.log("Before update - variant sizes:", variant.sizes);
       console.log("New sizes to set:", sizesArray);
 
-      variant.sizes = sizesArray.map((size) => ({
+      const sizesWithSku = await normalizeSizesWithSku({
+        sizesArray,
+        productId: variant.productId,
+        color: color || variant.color,
+      });
+
+      const duplicatedSize = new Set();
+
+      for (const item of sizesWithSku) {
+        const sizeKey = String(item.size || "").trim().toLowerCase();
+
+        if (!sizeKey) {
+          return res.status(400).json({ message: "Size không hợp lệ" });
+        }
+
+        if (duplicatedSize.has(sizeKey)) {
+          return res.status(400).json({
+            message: `Size ${item.size} bị trùng trong cùng một biến thể`,
+          });
+        }
+
+        duplicatedSize.add(sizeKey);
+      }
+
+      variant.sizes = sizesWithSku.map((size) => ({
         size: size.size,
         sku: size.sku || "",
-        stock: size.stock || 0,
-        price: size.price || 0,
-        originalPrice: size.originalPrice || 0,
-        discountPrice: size.discountPrice || 0,
-        discountPercent: size.discountPercent || 0,
-        onSale: size.onSale || false,
+        stock: Number(size.stock) || 0,
+        price: Number(size.price) || 0,
+        originalPrice: Number(size.originalPrice) || 0,
+        discountPrice: Number(size.discountPrice) || 0,
+        discountPercent: Number(size.discountPercent) || 0,
+        onSale: Boolean(size.onSale) || false,
         saleNote: size.saleNote || "",
-        isDefault: size.isDefault || false,
+        isDefault: Boolean(size.isDefault) || false,
         _id: size._id || new mongoose.Types.ObjectId(),
       }));
 

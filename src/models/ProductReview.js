@@ -12,28 +12,38 @@ const productReviewSchema = new mongoose.Schema(
       ref: "User",
       required: true,
     },
+    variantId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "ProductVariant",
+    },
+    color: {
+      type: String,
+      default: "",
+    },
+    colorCode: {
+      type: String,
+      default: "",
+    },
+    size: {
+      type: String,
+      default: "",
+    },
     rating: {
       type: Number,
+      required: true,
       min: 1,
       max: 5,
-      required: true,
     },
     comment: {
       type: String,
-      trim: true,
       default: "",
     },
     adminReply: {
+      message: String,
+      repliedAt: Date,
       adminId: {
         type: mongoose.Schema.Types.ObjectId,
         ref: "User",
-      },
-      message: {
-        type: String,
-        trim: true,
-      },
-      repliedAt: {
-        type: Date,
       },
     },
   },
