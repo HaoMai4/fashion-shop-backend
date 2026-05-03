@@ -1,40 +1,86 @@
 const express = require("express");
 const router = express.Router();
-const productController = require("../controllers/productController");
-const { authMiddleware, staffOrAdmin , adminOnly } = require("../middlewares/authMiddleware");
-const reviewController = require('../controllers/reviewController');
 
+const productController = require("../controllers/productController");
+const reviewController = require("../controllers/reviewController");
+
+const {
+  authMiddleware,
+  adminOnly,
+} = require("../middlewares/authMiddleware");
+
+// Product public routes
 router.get("/", productController.getAllProducts);
 router.get("/default-variant", productController.getAllProductsWithDefaultVariant);
 router.get("/all", productController.getAllProductsFiltered);
 router.get("/search", productController.searchProducts);
 router.get("/best-sellers", productController.getBestSellers);
 router.get("/new", productController.getNewProducts);
+router.get("/ml-recommend", productController.mlRecommend);
+router.get("/variant/details", productController.getVariantDetails);
+
+// Product detail routes
 router.get("/details/:slug", productController.getProductDetailsBySlug);
 router.get("/details/:slug/reviews", reviewController.getReviewsBySlug);
-router.get('/reviews/recent-customers', reviewController.getLatestFiveCustomerReviews);
 
+// Review routes
+router.get(
+  "/reviews/recent-customers",
+  reviewController.getLatestFiveCustomerReviews
+);
 
-// Admin: list all reviews with filters/pagination
-router.get('/reviews', reviewController.getAllReviews);
+router.get(
+  "/reviews",
+  authMiddleware,
+  adminOnly,
+  reviewController.getAllReviews
+);
 
-// create or update review (auth)
-router.post('/:productId/reviews', authMiddleware, reviewController.createOrUpdateReview);
+router.post(
+  "/:productId/reviews",
+  authMiddleware,
+  reviewController.createOrUpdateReview
+);
 
-// delete review (owner or admin)
-router.delete('/reviews/:id', authMiddleware, reviewController.deleteReview);
-// admin reply to a review
-router.put('/reviews/:id/reply', authMiddleware, adminOnly, reviewController.replyToReview);
+router.delete(
+  "/reviews/:id",
+  authMiddleware,
+  reviewController.deleteReview
+);
+
+router.put(
+  "/reviews/:id/reply",
+  authMiddleware,
+  adminOnly,
+  reviewController.replyToReview
+);
+
+// Recently viewed
 router.post("/recently-viewed", productController.getRecentlyViewedProducts);
-router.get("/variant/details", productController.getVariantDetails);
+
+// Admin product routes
+router.post(
+  "/add-product",
+  authMiddleware,
+  adminOnly,
+  productController.createProduct
+);
+
+router.put(
+  "/:id",
+  authMiddleware,
+  adminOnly,
+  productController.updateProduct
+);
+
+router.delete(
+  "/:id",
+  authMiddleware,
+  adminOnly,
+  productController.deleteProduct
+);
+
+// Dynamic slug route should stay near the bottom
 router.get("/:slug", productController.getProductBySlugCategory);
-
-// Staff/Admin
-router.post("/add-product", authMiddleware, adminOnly, productController.createProduct);
-router.put("/:id", authMiddleware, adminOnly, productController.updateProduct);
-router.delete("/:id", authMiddleware, adminOnly, productController.deleteProduct);
-
-// Public
-router.get("/ml-recommend", productController.mlRecommend);
 
 module.exports = router;
