@@ -99,6 +99,106 @@ async function prepareVoucherSnapshot(voucherCode, orderItems, subtotal, shippin
 
   return { voucher, discount, snapshot };
 }
+async function saveDoc(doc, session) {
+  if (session) {
+    return doc.save({ session });
+  }
+
+  return doc.save();
+}
+
+async function redeemVoucherForOrder(order, session = null) {
+  if (!order?.voucher?.voucherId || order.voucher?.redeemed) {
+    return false;
+  }
+
+  const voucherQuery = Voucher.findById(order.voucher.voucherId);
+  const voucher = session ? await voucherQuery.session(session) : await voucherQuery;
+
+  if (!voucher) {
+    throw new Error("Voucher không tồn tại");
+  }
+
+  if (
+    voucher.usageLimit !== null &&
+    voucher.usageLimit !== undefined &&
+    Number(voucher.usedCount || 0) >= Number(voucher.usageLimit)
+  ) {
+    throw new Error("Voucher đã hết lượt sử dụng");
+  }
+
+  if (
+    order.userId &&
+    voucher.perUserLimit !== null &&
+    voucher.perUserLimit !== undefined
+  ) {
+    const userRecord = voucher.usersUsed.find(
+      (item) => item.user?.toString() === order.userId.toString()
+    );
+
+    if (
+      userRecord &&
+      Number(userRecord.count || 0) >= Number(voucher.perUserLimit)
+    ) {
+      throw new Error("Bạn đã sử dụng voucher này quá số lần cho phép");
+    }
+
+    if (userRecord) {
+      userRecord.count = Number(userRecord.count || 0) + 1;
+    } else {
+      voucher.usersUsed.push({
+        user: order.userId,
+        count: 1,
+      });
+    }
+  }
+
+  voucher.usedCount = Number(voucher.usedCount || 0) + 1;
+
+  order.voucher.redeemed = true;
+  order.voucher.redeemedAt = new Date();
+
+  await saveDoc(voucher, session);
+  await saveDoc(order, session);
+
+  return true;
+}
+
+async function releaseVoucherForOrder(order, session = null) {
+  if (!order?.voucher?.voucherId || !order.voucher?.redeemed) {
+    return false;
+  }
+
+  const voucherQuery = Voucher.findById(order.voucher.voucherId);
+  const voucher = session ? await voucherQuery.session(session) : await voucherQuery;
+
+  if (voucher) {
+    voucher.usedCount = Math.max(0, Number(voucher.usedCount || 0) - 1);
+
+    if (order.userId) {
+      const userRecord = voucher.usersUsed.find(
+        (item) => item.user?.toString() === order.userId.toString()
+      );
+
+      if (userRecord) {
+        userRecord.count = Math.max(0, Number(userRecord.count || 0) - 1);
+      }
+
+      voucher.usersUsed = voucher.usersUsed.filter(
+        (item) => Number(item.count || 0) > 0
+      );
+    }
+
+    await saveDoc(voucher, session);
+  }
+
+  order.voucher.redeemed = false;
+  order.voucher.redeemedAt = null;
+
+  await saveDoc(order, session);
+
+  return true;
+}
 async function sendZNS(order, type) {
   try {
     const phone = String(
@@ -129,15 +229,15 @@ async function sendZNS(order, type) {
           company_name: "SHOPNOW",
           customer_name: String(
             order.shippingAddress?.fullName ||
-              order.guestInfo?.fullName ||
-              "Quý khách"
+            order.guestInfo?.fullName ||
+            "Quý khách"
           ),
           id: String(order.orderCode || ""),
           price: `${order.totalAmount || 0} VND`,
           address: String(
             order.shippingAddress?.addressLine1 ||
-              order.shippingAddress?.addressLine2 ||
-              ""
+            order.shippingAddress?.addressLine2 ||
+            ""
           ),
           mobile: phone,
           payment: order.paymentMethod?.status === "paid"
@@ -162,8 +262,8 @@ async function sendZNS(order, type) {
         templateData: {
           customer_name: String(
             order.shippingAddress?.fullName ||
-              order.guestInfo?.fullName ||
-              "Quý khách"
+            order.guestInfo?.fullName ||
+            "Quý khách"
           ),
           date: new Date().toLocaleDateString("vi-VN"),
           order_id: String(order.orderCode || ""),
@@ -261,13 +361,31 @@ exports.createOrder = async (req, res) => {
       baseOrder.guestInfo = {
         fullName: guestName,
         phone: guestPhone,
-       email: guestInfo.email || req.body.contactEmail || shippingAddress.email || null
+        email: guestInfo.email || req.body.contactEmail || shippingAddress.email || null
       };
     }
 
     if (paymentMethod.type !== "PayOS") {
       baseOrder.orderCode = generateOrderCode();
-      const order = await Order.create(baseOrder);
+
+      let order;
+
+      try {
+        order = await Order.create(baseOrder);
+
+        if (order.voucher?.voucherId) {
+          await redeemVoucherForOrder(order);
+        }
+      } catch (err) {
+        if (order?._id) {
+          await Order.findByIdAndDelete(order._id);
+        }
+
+        return res.status(400).json({
+          message: err.message || "Không thể ghi nhận voucher cho đơn hàng",
+        });
+      }
+
       if (userId) {
         await Cart.updateOne(
           { userId },
@@ -279,10 +397,14 @@ exports.createOrder = async (req, res) => {
         );
       }
 
-      // Send confirmation email immediately for non-online payment
       try {
         const recipient = order.shippingAddress?.email || order.guestInfo?.email || null;
-        if (recipient) sendOrderCreatedEmail(order, recipient).catch(err => console.warn("Send order email failed:", err));
+
+        if (recipient) {
+          sendOrderCreatedEmail(order, recipient).catch((err) =>
+            console.warn("Send order email failed:", err)
+          );
+        }
       } catch (e) {
         console.warn("send order email error:", e);
       }
@@ -351,7 +473,7 @@ exports.createOrder = async (req, res) => {
     });
   } catch (error) {
     console.error("createOrder error:", error);
-     res.status(500).json({ message: error.message, stack: error.stack });
+    res.status(500).json({ message: error.message, stack: error.stack });
   }
 };
 
@@ -514,6 +636,8 @@ exports.cancelOrder = async (req, res) => {
       await Cart.updateOne({ userId }, { $push: { items: { $each: cartItems } } }, { upsert: true });
     }
 
+    await releaseVoucherForOrder(order);
+
     await order.save();
     res.json({ message: "Đã hủy đơn hàng thành công", order });
   } catch (error) {
@@ -610,17 +734,24 @@ exports.approveOrderReport = async (req, res) => {
       console.warn('approveOrderReport: order not in reported state, proceeding to cancel anyway', order._id.toString());
     }
 
+    const previousStatus = report.previousStatus || order.orderStatus;
+
     // mark cancelled
     order.orderStatus = 'cancelled';
     if (!order.paymentMethod) order.paymentMethod = {};
     order.paymentMethod.status = 'cancelled';
     order.paymentMethod.cancelledAt = order.paymentMethod.cancelledAt || new Date();
 
-    // restore stock
-    try {
-      await restoreStock(order.items);
-    } catch (err) {
-      console.error('restoreStock error (approve report):', err);
+    const shouldRestoreStock = ["confirmed", "shipped", "delivered", "completed"].includes(
+      previousStatus
+    );
+
+    if (shouldRestoreStock) {
+      try {
+        await restoreStock(order.items);
+      } catch (err) {
+        console.error("restoreStock error (approve report):", err);
+      }
     }
 
     // return items to user's cart
@@ -641,6 +772,7 @@ exports.approveOrderReport = async (req, res) => {
         console.error('push back to cart error (approve report):', err);
       }
     }
+    await releaseVoucherForOrder(order);
 
     await order.save();
 
@@ -653,6 +785,61 @@ exports.approveOrderReport = async (req, res) => {
   } catch (err) {
     console.error('approveOrderReport error:', err);
     return res.status(500).json({ message: 'Lỗi khi xử lý báo cáo' });
+  }
+};
+
+// Admin: reject a cancellation report -> restore order to previous status
+exports.rejectOrderReport = async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const { id } = req.params;
+    const adminId = req.user?.id;
+    const { reason } = req.body || {};
+
+    const report = await OrderReport.findById(id);
+
+    if (!report) {
+      return res.status(404).json({ message: "Không tìm thấy báo cáo" });
+    }
+
+    if (report.status !== "pending") {
+      return res.status(400).json({ message: "Báo cáo đã được xử lý" });
+    }
+
+    const order = await Order.findById(report.orderId);
+
+    if (!order) {
+      return res.status(404).json({ message: "Không tìm thấy đơn hàng liên quan" });
+    }
+
+    const previousStatus = report.previousStatus || "pending";
+
+    if (order.orderStatus === "reported") {
+      order.orderStatus = previousStatus;
+    }
+
+    report.status = "rejected";
+    report.processedBy = adminId;
+    report.processedAt = new Date();
+
+    if (reason) {
+      report.rejectReason = String(reason).trim();
+    }
+
+    await order.save();
+    await report.save();
+
+    return res.json({
+      message: "Đã từ chối yêu cầu hủy đơn",
+      report,
+      order,
+    });
+  } catch (err) {
+    console.error("rejectOrderReport error:", err);
+    return res.status(500).json({ message: "Lỗi khi từ chối yêu cầu hủy" });
   }
 };
 
@@ -752,7 +939,7 @@ exports.getOrderById = async (req, res) => {
 exports.getOrderByCode = async (req, res) => {
   try {
     const { orderCode } = req.params;
-    
+
     const order = await Order.findOne({ orderCode })
       .populate("items.productId", "name slug")
       .populate("items.variantId", "color colorCode sizes images sku")
@@ -818,7 +1005,7 @@ async function renderInvoicePdfFromTemplate(order) {
     const imgTag = img ? `<img class="product-thumb" src="${img}" alt="" />` : '';
     const meta = [];
     if (it.sku) meta.push(it.sku);
-    if (it.size) meta.push('Size: ' + it.size); 
+    if (it.size) meta.push('Size: ' + it.size);
     const metaHtml = meta.length ? `<div class="product-meta">${meta.join(' • ')}</div>` : '';
     // product cell now includes image + name/meta in one column for cleaner layout
     const productCell = `<td><div class="product-item">${imgTag}<div><div class="product-name">${name}</div>${metaHtml}</div></div></td>`;
@@ -919,7 +1106,7 @@ exports.getOrdersAdmin = async (req, res) => {
       date
     } = req.query;
 
-  const filter = {};
+    const filter = {};
 
     // support multiple statuses: comma separated list or single
     if (status) {
@@ -974,7 +1161,7 @@ exports.getOrdersAdmin = async (req, res) => {
       if (dateTo) {
         const d = new Date(dateTo);
         // include whole day for dateTo (guess)
-        d.setHours(23,59,59,999);
+        d.setHours(23, 59, 59, 999);
         filter.createdAt.$lte = d;
       }
       if (!Object.keys(filter.createdAt).length) delete filter.createdAt;
@@ -1024,6 +1211,7 @@ exports.getOrdersAdmin = async (req, res) => {
       all: total,
       unconfirmed: unconfirmedCount || 0,
       pending: (byStatus.pending && byStatus.pending.count) || 0,
+      reported: (byStatus.reported && byStatus.reported.count) || 0,
       confirmed: (byStatus.confirmed && byStatus.confirmed.count) || 0,
       processing: sumOf(['pending', 'confirmed']),
       paid: byPayment.paid || 0,
@@ -1036,23 +1224,24 @@ exports.getOrdersAdmin = async (req, res) => {
       byStatus,
       byPayment
     };
-      // If the caller only wants numeric counts for tabs, return a minimal object with numbers.
-      if (req.query.countsOnly === 'true' || req.query.countsOnly === '1') {
-        const simple = {
-          all: total,
-          unconfirmed: unconfirmedCount || 0,
-          pending: (byStatus.pending && byStatus.pending.count) || 0,
-          confirmed: (byStatus.confirmed && byStatus.confirmed.count) || 0,
-          processing: sumOf(['pending', 'confirmed']),
-          paid: byPayment.paid || 0,
-          shipped: (byStatus.shipped && byStatus.shipped.count) || 0,
-          delivered: (byStatus.delivered && byStatus.delivered.count) || 0,
-          completed: (byStatus.completed && byStatus.completed.count) || 0,
-          cancelled: (byStatus.cancelled && byStatus.cancelled.count) || 0,
-          problems: byPayment.failed || 0
-        };
-        return res.json({ tabs: simple });
-      }
+    // If the caller only wants numeric counts for tabs, return a minimal object with numbers.
+    if (req.query.countsOnly === 'true' || req.query.countsOnly === '1') {
+      const simple = {
+        all: total,
+        unconfirmed: unconfirmedCount || 0,
+        pending: (byStatus.pending && byStatus.pending.count) || 0,
+        reported: (byStatus.reported && byStatus.reported.count) || 0,
+        confirmed: (byStatus.confirmed && byStatus.confirmed.count) || 0,
+        processing: sumOf(['pending', 'confirmed']),
+        paid: byPayment.paid || 0,
+        shipped: (byStatus.shipped && byStatus.shipped.count) || 0,
+        delivered: (byStatus.delivered && byStatus.delivered.count) || 0,
+        completed: (byStatus.completed && byStatus.completed.count) || 0,
+        cancelled: (byStatus.cancelled && byStatus.cancelled.count) || 0,
+        problems: byPayment.failed || 0
+      };
+      return res.json({ tabs: simple });
+    }
 
     // fetch paged orders
     const orders = await Order.find(filter)
@@ -1079,9 +1268,9 @@ exports.getOrdersAdmin = async (req, res) => {
         const email = o.shippingAddress?.email || o.guestInfo?.email || (o.userId && o.userId.email) || "";
         const row = [
           o.orderCode || "",
-          `"${(name || "").replace(/"/g, '""') }"`,
-          `"${(phone || "").replace(/"/g, '""') }"`,
-          `"${(email || "").replace(/"/g, '""') }"`,
+          `"${(name || "").replace(/"/g, '""')}"`,
+          `"${(phone || "").replace(/"/g, '""')}"`,
+          `"${(email || "").replace(/"/g, '""')}"`,
           o.orderStatus || "",
           o.paymentMethod?.status || "",
           o.subtotal || 0,
@@ -1218,6 +1407,7 @@ exports.updateOrderStatus = async (req, res) => {
           finalPrice: item.finalPrice || item.price || 0,
           name: item.name || ""
         }));
+
         try {
           await Cart.updateOne(
             { userId: order.userId },
@@ -1228,13 +1418,15 @@ exports.updateOrderStatus = async (req, res) => {
           console.error("push back to cart error (admin):", err);
         }
       }
+
+      await releaseVoucherForOrder(order);
     }
 
     // Handle completed: ensure payment is marked as paid and add to user's order history
     const willBeCompleted = orderStatus === "completed" && prevOrderStatus !== "completed";
     if (willBeCompleted) {
       // Đơn hàng hoàn tất phải đã thanh toán
-      if (order.paymentMethod.status !== "paid") {  
+      if (order.paymentMethod.status !== "paid") {
         order.paymentMethod.status = "paid";
         order.paymentMethod.paidAt = order.paymentMethod.paidAt || new Date();
       }
@@ -1266,17 +1458,17 @@ exports.updateOrderStatus = async (req, res) => {
 
     // Gửi email thông báo cập nhật trạng thái
     try {
-      const customerEmail = order.userId 
-        ? (await User.findById(order.userId))?.email 
+      const customerEmail = order.userId
+        ? (await User.findById(order.userId))?.email
         : order.guestInfo?.email || order.shippingAddress?.email;
-      
+
       if (customerEmail) {
         // Gửi email nếu có thay đổi trạng thái đơn hàng
         if (orderStatus && orderStatus !== prevOrderStatus) {
           await sendOrderStatusUpdateEmail(order, customerEmail, 'order', orderStatus);
           console.log(`📧 Email cập nhật trạng thái đơn hàng đã gửi đến: ${customerEmail}`);
         }
-        
+
         // Gửi email nếu có thay đổi trạng thái thanh toán
         if (paymentStatus && paymentStatus !== prevPaymentStatus) {
           await sendOrderStatusUpdateEmail(order, customerEmail, 'payment', paymentStatus);
@@ -1288,7 +1480,7 @@ exports.updateOrderStatus = async (req, res) => {
       // Không throw error để không làm fail toàn bộ request
     }
 
-    
+
     res.json({ message: "Cập nhật trạng thái thành công", order });
   } catch (error) {
     console.error("updateOrderStatus error:", error);
@@ -1316,7 +1508,7 @@ exports.confirmOrderByToken = async (req, res) => {
     order.paymentMethod.status = 'pending';
     await order.save();
 
-    try { await decreaseStock(order.items); } catch(e){ console.warn('decreaseStock', e); }
+    try { await decreaseStock(order.items); } catch (e) { console.warn('decreaseStock', e); }
     if (order.userId) {
       await Cart.updateOne({ userId: order.userId }, { $pull: { items: { variantId: { $in: order.items.map(i => i.variantId) } } } });
     }
@@ -1324,7 +1516,7 @@ exports.confirmOrderByToken = async (req, res) => {
     // send order created email
     const recipient = order.shippingAddress?.email || order.guestInfo?.email || null;
     if (recipient) sendOrderCreatedEmail(order, recipient).catch(e => console.warn('send order email failed', e));
-    
+
     await sendZNS(order, "confirmed");
     return res.json({ message: 'Xác nhận thành công', order });
   } catch (err) {

@@ -1,5 +1,6 @@
 const express = require("express");
 const router = express.Router();
+
 const {
   createOrder,
   getMyOrders,
@@ -12,25 +13,44 @@ const {
   cancelOrder,
   requestOrderCancellation,
   getOrdersAdmin,
-  updateOrderStatus
+  updateOrderStatus,
+  getOrderReportsAdmin,
+  approveOrderReport,
+  rejectOrderReport,
 } = require("../controllers/orderController");
-const { authMiddleware, authOptional, adminOnly } = require("../middlewares/authMiddleware");
+
+const {
+  authMiddleware,
+  authOptional,
+  adminOnly,
+} = require("../middlewares/authMiddleware");
+
 const statisController = require("../controllers/statisController");
 
+// Create order
 router.post("/create-orders", authOptional, createOrder);
 
+// PayOS webhook
 router.post("/payos/webhook", handlePayOSWebhook);
 
+// Invoice
 router.get("/invoice", authOptional, getOrderInvoice);
 
-// admin routes
+// Admin order routes
 router.get("/admin", authMiddleware, adminOnly, getOrdersAdmin);
 router.patch("/admin/:id/status", authMiddleware, adminOnly, updateOrderStatus);
+
+// Admin order report routes
+router.get("/admin/reports", authMiddleware, adminOnly, getOrderReportsAdmin);
+router.patch("/admin/reports/:id/approve", authMiddleware, adminOnly, approveOrderReport);
+router.patch("/admin/reports/:id/reject", authMiddleware, adminOnly, rejectOrderReport);
+
+// Admin stats routes
 router.get("/stats/overview", authMiddleware, adminOnly, statisController.getAdminStats);
 router.get("/stats/sales", authMiddleware, adminOnly, statisController.getSalesByPeriod);
 router.get("/stats/top-products", authMiddleware, adminOnly, statisController.getTopProducts);
 
-// user routes
+// User order routes
 router.get("/", authMiddleware, getMyOrders);
 router.get("/my-orders/:orderCode", authMiddleware, getMyOrderByCode);
 router.get("/code/:orderCode", getOrderByCode);
@@ -38,10 +58,5 @@ router.get("/payment-status/:orderCode", checkPaymentStatus);
 router.get("/:id", authMiddleware, getOrderById);
 router.post("/:id/cancel", authMiddleware, cancelOrder);
 router.post("/:id/report", authMiddleware, requestOrderCancellation);
-
-// admin reports
-const { getOrderReportsAdmin, approveOrderReport } = require("../controllers/orderController");
-router.get("/admin/reports", authMiddleware, adminOnly, getOrderReportsAdmin);
-router.patch("/admin/reports/:id/approve", authMiddleware, adminOnly, approveOrderReport);
 
 module.exports = router;
