@@ -8,6 +8,7 @@ const ProductRecentlyViewed = require('../models/ProductRecentlyViewed');
 const Cart = require("../models/Cart");
 const User = require("../models/User");
 const CFRecommendation = require("../models/CFRecommendation");
+const ProductSearchHistory = require("../models/ProductSearchHistory");
 
 function toId(value) {
   if (!value) return "";
@@ -125,16 +126,16 @@ function buildProductCardData(product, variants, extra = {}) {
     images: Array.isArray(variant.images) ? variant.images : [],
     sizes: Array.isArray(variant.sizes)
       ? variant.sizes.map((size) => ({
-          size: size.size,
-          sku: size.sku || "",
-          price: size.price || 0,
-          discountPrice: size.discountPrice || 0,
-          stock: size.stock || 0,
-          finalPrice:
-            Number(size.discountPrice || 0) > 0
-              ? Number(size.discountPrice || 0)
-              : Number(size.price || 0),
-        }))
+        size: size.size,
+        sku: size.sku || "",
+        price: size.price || 0,
+        discountPrice: size.discountPrice || 0,
+        stock: size.stock || 0,
+        finalPrice:
+          Number(size.discountPrice || 0) > 0
+            ? Number(size.discountPrice || 0)
+            : Number(size.price || 0),
+      }))
       : [],
   }));
 
@@ -200,6 +201,440 @@ async function enrichProductsForCards(products, extraByProductId = new Map()) {
   });
 }
 
+function normalizeSearchKeyword(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ");
+}
+
+function escapeRegex(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function getCurrentUserId(req) {
+  return req.user?._id || req.user?.id || req.user?.userId || null;
+}
+
+function normalizeForRecommendationMatch(value) {
+  return normalizeSearchKeyword(value)
+    .replace(/[-_]+/g, " ")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildRecommendationProductText(product) {
+  const category =
+    product.categoryId && typeof product.categoryId === "object"
+      ? product.categoryId
+      : null;
+
+  return normalizeForRecommendationMatch(
+    [
+      product.name,
+      product.slug,
+      product.shortDescription,
+      product.brand,
+      product.material,
+      product.gender,
+      Array.isArray(product.tags) ? product.tags.join(" ") : "",
+      category?.name,
+      category?.slug,
+    ]
+      .filter(Boolean)
+      .join(" ")
+  );
+}
+
+function buildSearchKeywordVariants(keyword) {
+  const normalized = normalizeForRecommendationMatch(keyword);
+
+  if (!normalized) return [];
+
+  const genericWords = new Set(["ao", "quan", "do", "san", "pham"]);
+
+  const tokens = normalized
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+
+  const meaningfulTokens = tokens.filter((token) => !genericWords.has(token));
+
+  return Array.from(
+    new Set(
+      [
+        normalized,
+        normalized.replace(/^(ao|quan|do)\s+/g, "").trim(),
+        meaningfulTokens.join(" ").trim(),
+      ].filter(Boolean)
+    )
+  );
+}
+
+function scoreProductBySearchHistory(product, searchHistoryItems) {
+  if (!Array.isArray(searchHistoryItems) || !searchHistoryItems.length) {
+    return 0;
+  }
+
+  const productText = buildRecommendationProductText(product);
+  let score = 0;
+
+  searchHistoryItems.forEach((item) => {
+    const keyword = item.normalizedKeyword || item.keyword;
+    const variants = buildSearchKeywordVariants(keyword);
+
+    if (!variants.length) return;
+
+    const matched = variants.some((variant) => productText.includes(variant));
+
+    if (matched) {
+      const countScore = Math.min(4, Number(item.count || 1));
+      score += 5 + countScore;
+    }
+  });
+
+  return Math.min(score, 18);
+}
+
+exports.getSearchHistory = async (req, res) => {
+  try {
+    const userId = getCurrentUserId(req);
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Vui lòng đăng nhập để xem lịch sử tìm kiếm",
+        history: [],
+      });
+    }
+
+    const limit = Math.max(1, Math.min(20, Number(req.query.limit) || 8));
+
+    const history = await ProductSearchHistory.find({ userId })
+      .sort({ lastSearchedAt: -1 })
+      .limit(limit)
+      .lean();
+
+    return res.json({
+      history: history.map((item) => ({
+        _id: item._id,
+        keyword: item.keyword,
+        normalizedKeyword: item.normalizedKeyword,
+        count: item.count || 1,
+        lastSearchedAt: item.lastSearchedAt,
+      })),
+    });
+  } catch (error) {
+    console.error("getSearchHistory error:", error);
+    return res.status(500).json({
+      message: "Không thể tải lịch sử tìm kiếm",
+      error: error.message,
+      history: [],
+    });
+  }
+};
+
+exports.saveSearchHistory = async (req, res) => {
+  try {
+    const userId = getCurrentUserId(req);
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Vui lòng đăng nhập để lưu lịch sử tìm kiếm",
+      });
+    }
+
+    const keyword = String(req.body?.keyword || "").trim();
+    const normalizedKeyword = normalizeSearchKeyword(keyword);
+
+    if (!normalizedKeyword || normalizedKeyword.length < 2) {
+      return res.status(400).json({
+        message: "Từ khóa tìm kiếm không hợp lệ",
+      });
+    }
+
+    const saved = await ProductSearchHistory.findOneAndUpdate(
+      {
+        userId,
+        normalizedKeyword,
+      },
+      {
+        $set: {
+          keyword,
+          lastSearchedAt: new Date(),
+        },
+        $inc: {
+          count: 1,
+        },
+      },
+      {
+        new: true,
+        upsert: true,
+        setDefaultsOnInsert: true,
+      }
+    ).lean();
+
+    return res.status(200).json({
+      message: "Đã lưu lịch sử tìm kiếm",
+      history: {
+        _id: saved._id,
+        keyword: saved.keyword,
+        normalizedKeyword: saved.normalizedKeyword,
+        count: saved.count,
+        lastSearchedAt: saved.lastSearchedAt,
+      },
+    });
+  } catch (error) {
+    console.error("saveSearchHistory error:", error);
+    return res.status(500).json({
+      message: "Không thể lưu lịch sử tìm kiếm",
+      error: error.message,
+    });
+  }
+};
+
+exports.clearSearchHistory = async (req, res) => {
+  try {
+    const userId = getCurrentUserId(req);
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Vui lòng đăng nhập để xóa lịch sử tìm kiếm",
+      });
+    }
+
+    await ProductSearchHistory.deleteMany({ userId });
+
+    return res.json({
+      message: "Đã xóa lịch sử tìm kiếm",
+    });
+  } catch (error) {
+    console.error("clearSearchHistory error:", error);
+    return res.status(500).json({
+      message: "Không thể xóa lịch sử tìm kiếm",
+      error: error.message,
+    });
+  }
+};
+
+exports.deleteSearchHistoryItem = async (req, res) => {
+  try {
+    const userId = getCurrentUserId(req);
+    const { id } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Vui lòng đăng nhập để xóa lịch sử tìm kiếm",
+      });
+    }
+
+    if (!id) {
+      return res.status(400).json({
+        message: "Thiếu mã lịch sử tìm kiếm",
+      });
+    }
+
+    await ProductSearchHistory.deleteOne({
+      _id: id,
+      userId,
+    });
+
+    return res.json({
+      message: "Đã xóa mục lịch sử tìm kiếm",
+    });
+  } catch (error) {
+    console.error("deleteSearchHistoryItem error:", error);
+    return res.status(500).json({
+      message: "Không thể xóa mục lịch sử tìm kiếm",
+      error: error.message,
+    });
+  }
+};
+
+exports.getSearchSuggestions = async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    const limit = Math.max(1, Math.min(10, Number(req.query.limit) || 6));
+
+    const normalizeForMatch = (value) =>
+      normalizeSearchKeyword(value)
+        .replace(/[-_]+/g, " ")
+        .replace(/[^\w\s]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    const buildProductSearchText = (product) => {
+      const category =
+        product.categoryId && typeof product.categoryId === "object"
+          ? product.categoryId
+          : null;
+
+      return normalizeForMatch(
+        [
+          product.name,
+          product.slug,
+          product.shortDescription,
+          product.brand,
+          product.material,
+          product.gender,
+          Array.isArray(product.tags) ? product.tags.join(" ") : "",
+          category?.name,
+          category?.slug,
+        ]
+          .filter(Boolean)
+          .join(" ")
+      );
+    };
+
+    const buildCategorySearchText = (category) =>
+      normalizeForMatch([category.name, category.slug].filter(Boolean).join(" "));
+
+    if (!q) {
+      const products = await Product.find({ status: "active" })
+        .populate("categoryId", "name slug")
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean();
+
+      const enrichedProducts = await enrichProductsForCards(products);
+
+      return res.json({
+        query: q,
+        products: enrichedProducts,
+        keywordSuggestions: [],
+      });
+    }
+
+    const normalizedQuery = normalizeForMatch(q);
+    const queryTokens = normalizedQuery
+      .split(" ")
+      .map((item) => item.trim())
+      .filter((item) => item.length >= 2);
+
+    if (!normalizedQuery || !queryTokens.length) {
+      return res.json({
+        query: q,
+        products: [],
+        keywordSuggestions: [],
+      });
+    }
+
+    const [categories, products] = await Promise.all([
+      Category.find({})
+        .select("_id name slug")
+        .limit(100)
+        .lean(),
+
+      Product.find({ status: "active" })
+        .populate("categoryId", "name slug")
+        .sort({ createdAt: -1 })
+        .limit(200)
+        .lean(),
+    ]);
+
+    const matchedCategories = categories
+      .map((category) => {
+        const text = buildCategorySearchText(category);
+
+        let score = 0;
+
+        if (text.includes(normalizedQuery)) {
+          score += 50;
+        }
+
+        const matchedTokenCount = queryTokens.filter((token) =>
+          text.includes(token)
+        ).length;
+
+        if (matchedTokenCount === queryTokens.length) {
+          score += 30;
+        } else if (matchedTokenCount > 0) {
+          score += matchedTokenCount * 5;
+        }
+
+        return {
+          category,
+          score,
+        };
+      })
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8)
+      .map((item) => item.category);
+
+    const matchedCategoryIds = new Set(
+      matchedCategories.map((category) => String(category._id))
+    );
+
+    const matchedProducts = products
+      .map((product) => {
+        const text = buildProductSearchText(product);
+        const categoryId = product.categoryId?._id
+          ? String(product.categoryId._id)
+          : String(product.categoryId || "");
+
+        let score = 0;
+
+        if (normalizeForMatch(product.name).includes(normalizedQuery)) {
+          score += 70;
+        }
+
+        if (text.includes(normalizedQuery)) {
+          score += 50;
+        }
+
+        const matchedTokenCount = queryTokens.filter((token) =>
+          text.includes(token)
+        ).length;
+
+        if (matchedTokenCount === queryTokens.length) {
+          score += 35;
+        } else if (matchedTokenCount > 0) {
+          score += matchedTokenCount * 8;
+        }
+
+        if (categoryId && matchedCategoryIds.has(categoryId)) {
+          score += 25;
+        }
+
+        return {
+          product,
+          score,
+        };
+      })
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+      .map((item) => item.product);
+
+    const enrichedProducts = await enrichProductsForCards(matchedProducts);
+
+    const keywordSuggestions = [
+      ...matchedCategories.map((category) => category.name),
+      ...matchedProducts.map((product) => product.name),
+    ]
+      .filter(Boolean)
+      .filter((value, index, arr) => arr.indexOf(value) === index)
+      .slice(0, 8);
+
+    return res.json({
+      query: q,
+      products: enrichedProducts,
+      keywordSuggestions,
+    });
+  } catch (error) {
+    console.error("getSearchSuggestions error:", error);
+    return res.status(500).json({
+      message: "Không thể tải gợi ý tìm kiếm",
+      error: error.message,
+      products: [],
+      keywordSuggestions: [],
+    });
+  }
+};
+
 exports.getForYouProducts = async (req, res) => {
   try {
     const userId = req.user?.id || req.user?._id || req.user?.userId;
@@ -213,7 +648,7 @@ exports.getForYouProducts = async (req, res) => {
 
     const limit = Math.max(1, Math.min(20, Number(req.query.limit) || 10));
 
-    const [user, cart, recentViewDocs, userOrders] = await Promise.all([
+    const [user, cart, recentViewDocs, userOrders, searchHistory] = await Promise.all([
       User.findById(userId).select("wishlist orderHistory gender").lean(),
 
       Cart.findOne({ userId })
@@ -229,6 +664,11 @@ exports.getForYouProducts = async (req, res) => {
         .sort({ createdAt: -1 })
         .limit(10)
         .select("items.productId orderStatus createdAt")
+        .lean(),
+
+      ProductSearchHistory.find({ userId })
+        .sort({ lastSearchedAt: -1 })
+        .limit(8)
         .lean(),
     ]);
 
@@ -291,6 +731,32 @@ exports.getForYouProducts = async (req, res) => {
     ].forEach((productId) => {
       addScore(seedScoreMap, productId, 6, "Từ sản phẩm đã xem gần đây");
     });
+
+    const searchMatchedProductIds = [];
+
+    if (Array.isArray(searchHistory) && searchHistory.length) {
+      const productsForSearchHistory = await Product.find({ status: "active" })
+        .populate("categoryId", "name slug")
+        .sort({ createdAt: -1 })
+        .limit(200)
+        .lean();
+
+      productsForSearchHistory.forEach((product) => {
+        const searchScore = scoreProductBySearchHistory(product, searchHistory);
+
+        if (searchScore > 0) {
+          const productId = String(product._id);
+          searchMatchedProductIds.push(productId);
+
+          addScore(
+            seedScoreMap,
+            productId,
+            searchScore,
+            "Từ lịch sử tìm kiếm"
+          );
+        }
+      });
+    }
 
     const seedIds = [...seedScoreMap.keys()];
 
@@ -372,6 +838,9 @@ exports.getForYouProducts = async (req, res) => {
     if (brands.length) candidateOr.push({ brand: { $in: brands } });
     if (genders.length) candidateOr.push({ gender: { $in: genders } });
     if (cfProductIds.length) candidateOr.push({ _id: { $in: cfProductIds } });
+    if (searchMatchedProductIds.length) {
+      candidateOr.push({ _id: { $in: searchMatchedProductIds } });
+    }
 
     const candidateFilter = {
       status: "active",
@@ -452,7 +921,14 @@ exports.getForYouProducts = async (req, res) => {
           reasons.add("Dữ liệu gợi ý cộng tác");
         }
 
+        const searchHistoryScore = scoreProductBySearchHistory(candidate, searchHistory);
+        if (searchHistoryScore > 0) {
+          score += searchHistoryScore;
+          reasons.add("Phù hợp lịch sử tìm kiếm của bạn");
+        }
+
         const variants = variantsByProduct[candidateId] || [];
+
         if (hasSaleVariant(variants)) {
           score += 4;
           reasons.add("Đang có ưu đãi");
@@ -656,21 +1132,21 @@ exports.deleteProduct = async (req, res) => {
 exports.getProductBySlugCategory = async (req, res) => {
   try {
     const { slug } = req.params;
-    const { 
-      page = 1, 
-      limit = 8, 
+    const {
+      page = 1,
+      limit = 8,
       sortBy = 'createdAt',
       sortOrder = 'desc',
       minPrice,
       maxPrice,
       color,
-      size 
+      size
     } = req.query;
 
     const PAGE = parseInt(page);
     const LIMIT = parseInt(limit);
 
-    const GENDER_GROUPS = new Set(['nam','nu','tre-em']);
+    const GENDER_GROUPS = new Set(['nam', 'nu', 'tre-em']);
     let productFilter;
     let categoryMeta;
 
@@ -708,7 +1184,7 @@ exports.getProductBySlugCategory = async (req, res) => {
       if (!category) {
         return res.status(404).json({ message: 'Category not found' });
       }
-      productFilter = { 
+      productFilter = {
         categoryId: category._id,
         status: 'active'
       };
@@ -739,7 +1215,7 @@ exports.getProductBySlugCategory = async (req, res) => {
       products.map(async (product) => {
         const variants = await ProductVariant.find({ productId: product._id }).lean();
 
-        const validVariants = variants.filter(v => 
+        const validVariants = variants.filter(v =>
           Array.isArray(v.sizes) && v.sizes.some(s => (s.stock || 0) > 0)
         );
 
@@ -792,30 +1268,30 @@ exports.getProductBySlugCategory = async (req, res) => {
 
         return {
           _id: product._id,
-            name: product.name,
-            slug: product.slug,
-            shortDescription: product.shortDescription,
-            category: product.categoryId,
-            rating: product.rating,
-            price: minPriceVariant?.price || 0,
-            discountPrice: minPriceVariant?.discountPrice,
-            onSale: !!(minPriceVariant?.discountPrice && minPriceVariant.discountPrice > 0),
-            finalPrice: minPriceVariant?.finalPrice || 0,
-            colorVariants: uniqueColorVariants.map(v => ({
-              color: v.color,
-              colorCode: v.colorCode,
-              images: v.images,
-              sizes: v.sizes.map(s => ({
-                size: s.size,
-                price: s.price,
-                discountPrice: s.discountPrice,
-                stock: s.stock
-              }))
-            })),
-            availableColors,
-            availableSizes,
-            totalStock: validVariants.reduce((sum, v) =>
-              sum + v.sizes.reduce((sSum, s) => sSum + (s.stock || 0), 0), 0)
+          name: product.name,
+          slug: product.slug,
+          shortDescription: product.shortDescription,
+          category: product.categoryId,
+          rating: product.rating,
+          price: minPriceVariant?.price || 0,
+          discountPrice: minPriceVariant?.discountPrice,
+          onSale: !!(minPriceVariant?.discountPrice && minPriceVariant.discountPrice > 0),
+          finalPrice: minPriceVariant?.finalPrice || 0,
+          colorVariants: uniqueColorVariants.map(v => ({
+            color: v.color,
+            colorCode: v.colorCode,
+            images: v.images,
+            sizes: v.sizes.map(s => ({
+              size: s.size,
+              price: s.price,
+              discountPrice: s.discountPrice,
+              stock: s.stock
+            }))
+          })),
+          availableColors,
+          availableSizes,
+          totalStock: validVariants.reduce((sum, v) =>
+            sum + v.sizes.reduce((sSum, s) => sSum + (s.stock || 0), 0), 0)
         };
       })
     );
@@ -843,7 +1319,7 @@ exports.getProductBySlugCategory = async (req, res) => {
 
     // 5. Sort lại theo price nếu cần
     if (sortBy === 'price') {
-      filteredProducts = [...filteredProducts].sort((a,b) => 
+      filteredProducts = [...filteredProducts].sort((a, b) =>
         sortOrder === 'desc'
           ? b.finalPrice - a.finalPrice
           : a.finalPrice - b.finalPrice
@@ -897,7 +1373,7 @@ exports.getProductDetailsBySlug = async (req, res) => {
         variants: [],
         availableColors: [],
         availableSizes: [],
-        colorSizeMap: {},  
+        colorSizeMap: {},
         minPrice: 0,
         maxPrice: 0,
         totalStock: 0
@@ -918,7 +1394,7 @@ exports.getProductDetailsBySlug = async (req, res) => {
     const colorSizeMap = {};
 
     // --- Reviews: summary + recent reviews ---
-    let reviewsSummary = { average: 0, count: 0, breakdown: { 1:0,2:0,3:0,4:0,5:0 } };
+    let reviewsSummary = { average: 0, count: 0, breakdown: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 } };
     let recentReviews = [];
     try {
       const stats = await ProductReview.aggregate([
@@ -933,7 +1409,7 @@ exports.getProductDetailsBySlug = async (req, res) => {
         { $match: { productId: product._id, approved: true } },
         { $group: { _id: '$rating', count: { $sum: 1 } } }
       ]);
-      (breakdown || []).forEach(b => { const k = Number(b._id); if (k>=1 && k<=5) reviewsSummary.breakdown[k] = b.count; });
+      (breakdown || []).forEach(b => { const k = Number(b._id); if (k >= 1 && k <= 5) reviewsSummary.breakdown[k] = b.count; });
 
       recentReviews = await ProductReview.find({ productId: product._id, approved: true })
         .sort({ createdAt: -1 })
@@ -943,7 +1419,7 @@ exports.getProductDetailsBySlug = async (req, res) => {
         .lean();
     } catch (e) {
       console.error('Error loading product reviews for details:', e && e.message ? e.message : e);
-      reviewsSummary = { average: 0, count: 0, breakdown: {1:0,2:0,3:0,4:0,5:0} };
+      reviewsSummary = { average: 0, count: 0, breakdown: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 } };
       recentReviews = [];
     }
 
@@ -1023,7 +1499,7 @@ exports.getProductDetailsBySlug = async (req, res) => {
       })),
       availableColors,
       availableSizes,
-      colorSizeMap,   
+      colorSizeMap,
       minPrice: minPrice === Infinity ? 0 : minPrice,
       maxPrice,
       totalStock,
@@ -1058,9 +1534,9 @@ exports.getProductDetailsBySlug = async (req, res) => {
 
 exports.searchProducts = async (req, res) => {
   try {
-    const { 
+    const {
       q,
-      page = 1, 
+      page = 1,
       limit = 20,
       sortBy = 'relevance',
       sortOrder = 'desc',
@@ -1072,7 +1548,7 @@ exports.searchProducts = async (req, res) => {
     } = req.query;
 
     if (!q || q.trim().length === 0) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         message: 'Search query is required',
         products: [],
         pagination: {
@@ -1084,7 +1560,7 @@ exports.searchProducts = async (req, res) => {
       });
     }
 
-    const searchTerm = q.trim();  
+    const searchTerm = q.trim();
     const searchTerms = searchTerm.split(/\s+/).filter(term => term.length > 0);
     const regexPatterns = searchTerms.map(term => new RegExp(term, 'i'));
 
@@ -1095,7 +1571,7 @@ exports.searchProducts = async (req, res) => {
         { shortDescription: { $regex: searchTerm, $options: 'i' } },
         { brand: { $regex: searchTerm, $options: 'i' } },
         { tags: { $in: regexPatterns } },
-        
+
         ...searchTerms.map(term => ({
           name: { $regex: term, $options: 'i' }
         })),
@@ -1121,7 +1597,7 @@ exports.searchProducts = async (req, res) => {
     const productsWithRelevance = await Promise.all(
       products.map(async (product) => {
         const variants = await ProductVariant.find({ productId: product._id });
-        const validVariants = variants.filter(v => 
+        const validVariants = variants.filter(v =>
           v.sizes.some(s => s.stock > 0)
         );
 
@@ -1144,14 +1620,14 @@ exports.searchProducts = async (req, res) => {
         // Match từng từ trong search term
         searchTerms.forEach(term => {
           const lowerTerm = term.toLowerCase();
-          
+
           // Trong name
           if (lowerName === lowerTerm) relevanceScore += 40;
           else if (lowerName.includes(lowerTerm)) relevanceScore += 20;
-          
+
           // Trong description
           if (lowerDescription.includes(lowerTerm)) relevanceScore += 10;
-          
+
           // Trong brand
           if (lowerBrand.includes(lowerTerm)) relevanceScore += 15;
         });
@@ -1162,7 +1638,7 @@ exports.searchProducts = async (req, res) => {
             const lowerTag = tag.toLowerCase();
             if (lowerTag === lowerSearchTerm) relevanceScore += 30;
             else if (lowerTag.includes(lowerSearchTerm)) relevanceScore += 15;
-            
+
             searchTerms.forEach(term => {
               if (lowerTag.includes(term.toLowerCase())) relevanceScore += 8;
             });
@@ -1170,12 +1646,12 @@ exports.searchProducts = async (req, res) => {
         }
 
         // Ưu tiên products có nhiều từ khớp hơn
-        const matchedTerms = searchTerms.filter(term => 
+        const matchedTerms = searchTerms.filter(term =>
           lowerName.includes(term.toLowerCase()) ||
           lowerDescription.includes(term.toLowerCase()) ||
           lowerBrand.includes(term.toLowerCase())
         );
-        
+
         if (matchedTerms.length === searchTerms.length) {
           relevanceScore += 25; // Tất cả từ đều khớp
         } else if (matchedTerms.length > 0) {
@@ -1198,7 +1674,7 @@ exports.searchProducts = async (req, res) => {
           variant.sizes.forEach(s => {
             const finalPrice = s.discountPrice && s.discountPrice > 0 ? s.discountPrice : s.price;
             const originalPrice = s.price;
-            
+
             if (!minPriceVariant || finalPrice < minPriceVariant.finalPrice) {
               minPriceVariant = {
                 ...s.toObject(),
@@ -1208,7 +1684,7 @@ exports.searchProducts = async (req, res) => {
                 discountPercentage: s.discountPrice ? Math.round((1 - s.discountPrice / s.price) * 100) : 0
               };
             }
-            
+
             if (!maxPriceVariant || finalPrice > maxPriceVariant.finalPrice) {
               maxPriceVariant = {
                 ...s.toObject(),
@@ -1245,11 +1721,11 @@ exports.searchProducts = async (req, res) => {
           })),
           availableColors,
           availableSizes,
-          totalStock: validVariants.reduce((sum, v) => 
+          totalStock: validVariants.reduce((sum, v) =>
             sum + v.sizes.reduce((sSum, s) => sSum + s.stock, 0), 0),
           relevanceScore,
           searchMatchDetails: {
-            nameMatches: searchTerms.filter(term => 
+            nameMatches: searchTerms.filter(term =>
               product.name.toLowerCase().includes(term.toLowerCase())
             ).length,
             totalSearchTerms: searchTerms.length
@@ -1274,13 +1750,13 @@ exports.searchProducts = async (req, res) => {
     }
 
     if (color) {
-      filteredProducts = filteredProducts.filter(product => 
+      filteredProducts = filteredProducts.filter(product =>
         product.availableColors.includes(color)
       );
     }
 
     if (size) {
-      filteredProducts = filteredProducts.filter(product => 
+      filteredProducts = filteredProducts.filter(product =>
         product.availableSizes.includes(size)
       );
     }
@@ -1288,8 +1764,8 @@ exports.searchProducts = async (req, res) => {
     // 6. Sort products với ưu tiên relevance
     if (sortBy === 'price') {
       filteredProducts.sort((a, b) => {
-        return sortOrder === 'desc' 
-          ? b.finalPrice - a.finalPrice 
+        return sortOrder === 'desc'
+          ? b.finalPrice - a.finalPrice
           : a.finalPrice - b.finalPrice;
       });
     } else {
@@ -1297,7 +1773,7 @@ exports.searchProducts = async (req, res) => {
         // Ưu tiên products match tất cả từ khóa
         const aAllTerms = a.searchMatchDetails.nameMatches === a.searchMatchDetails.totalSearchTerms;
         const bAllTerms = b.searchMatchDetails.nameMatches === b.searchMatchDetails.totalSearchTerms;
-        
+
         if (aAllTerms && !bAllTerms) return -1;
         if (!aAllTerms && bAllTerms) return 1;
         return b.relevanceScore - a.relevanceScore;
@@ -1324,19 +1800,19 @@ exports.searchProducts = async (req, res) => {
             { shortDescription: { $regex: simplerQuery, $options: 'i' } }
           ]
         }).limit(3);
-        
+
         if (suggestionProducts.length > 0) {
           suggestions.push(`Thử tìm với: "${simplerQuery}"`);
         }
       }
-      
+
       const relatedProducts = await Product.find({
         status: 'active',
         $or: searchTerms.map(term => ({
           name: { $regex: term, $options: 'i' }
         }))
       }).limit(2);
-      
+
       suggestions.push(...relatedProducts.map(p => p.name));
     }
 
@@ -1378,9 +1854,9 @@ exports.searchProducts = async (req, res) => {
 
   } catch (error) {
     console.error('Search products error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       message: 'Internal server error',
-      error: error.message 
+      error: error.message
     });
   }
 };
@@ -1440,16 +1916,16 @@ exports.getVariantDetails = async (req, res) => {
       },
       selectedSize: sizeInfo
         ? {
-            size: sizeInfo.size,
-            price: sizeInfo.price,
-            discountPrice: sizeInfo.discountPrice,
-            stock: sizeInfo.stock,
-            finalPrice:
-              sizeInfo.discountPrice && sizeInfo.discountPrice > 0
-                ? sizeInfo.discountPrice
-                : sizeInfo.price,
-            onSale: sizeInfo.onSale,
-          }
+          size: sizeInfo.size,
+          price: sizeInfo.price,
+          discountPrice: sizeInfo.discountPrice,
+          stock: sizeInfo.stock,
+          finalPrice:
+            sizeInfo.discountPrice && sizeInfo.discountPrice > 0
+              ? sizeInfo.discountPrice
+              : sizeInfo.price,
+          onSale: sizeInfo.onSale,
+        }
         : null,
     };
 
@@ -1629,11 +2105,13 @@ exports.getBestSellers = async (req, res) => {
     const agg = await Order.aggregate([
       { $match: { orderStatus: { $in: ["delivered", "completed"] }, createdAt: { $gte: since } } },
       { $unwind: "$items" },
-      { $group: {
-        _id: "$items.productId",
-        soldQuantity: { $sum: "$items.quantity" },
-        lastSoldAt: { $max: "$createdAt" }
-      } },
+      {
+        $group: {
+          _id: "$items.productId",
+          soldQuantity: { $sum: "$items.quantity" },
+          lastSoldAt: { $max: "$createdAt" }
+        }
+      },
       { $sort: { soldQuantity: -1, lastSoldAt: -1 } },
       { $limit: limit }
     ]);

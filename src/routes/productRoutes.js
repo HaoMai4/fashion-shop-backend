@@ -7,6 +7,7 @@ const reviewController = require("../controllers/reviewController");
 const {
   authMiddleware,
   adminOnly,
+  authOptional,
 } = require("../middlewares/authMiddleware");
 
 // Product public routes
@@ -19,6 +20,37 @@ router.get("/new", productController.getNewProducts);
 router.get("/ml-recommend", productController.mlRecommend);
 router.get("/for-you", authMiddleware, productController.getForYouProducts);
 router.get("/variant/details", productController.getVariantDetails);
+
+// Search suggestions and search history
+router.get(
+  "/suggestions",
+  authOptional,
+  productController.getSearchSuggestions
+);
+
+router.get(
+  "/search-history",
+  authMiddleware,
+  productController.getSearchHistory
+);
+
+router.post(
+  "/search-history",
+  authMiddleware,
+  productController.saveSearchHistory
+);
+
+router.delete(
+  "/search-history/item/:id",
+  authMiddleware,
+  productController.deleteSearchHistoryItem
+);
+
+router.delete(
+  "/search-history",
+  authMiddleware,
+  productController.clearSearchHistory
+);
 
 // Product detail routes
 router.get("/details/:slug", productController.getProductDetailsBySlug);
@@ -35,12 +67,6 @@ router.get(
   authMiddleware,
   adminOnly,
   reviewController.getAllReviews
-);
-
-router.post(
-  "/:productId/reviews",
-  authMiddleware,
-  reviewController.createOrUpdateReview
 );
 
 router.put(
@@ -60,6 +86,12 @@ router.put(
   authMiddleware,
   adminOnly,
   reviewController.replyToReview
+);
+
+router.post(
+  "/:productId/reviews",
+  authMiddleware,
+  reviewController.createOrUpdateReview
 );
 
 // Recently viewed
@@ -87,7 +119,7 @@ router.delete(
   productController.deleteProduct
 );
 
-// Dynamic slug route should stay near the bottom
+// Dynamic slug route should stay at the bottom
 router.get("/:slug", productController.getProductBySlugCategory);
 
 module.exports = router;
