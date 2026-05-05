@@ -5,6 +5,524 @@ const mlService = require("../services/mlRecommenderService");
 const Order = require("../models/Order");
 const ProductReview = require('../models/ProductReview');
 const ProductRecentlyViewed = require('../models/ProductRecentlyViewed');
+const Cart = require("../models/Cart");
+const User = require("../models/User");
+const CFRecommendation = require("../models/CFRecommendation");
+
+function toId(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (value._id) return String(value._id);
+  return String(value);
+}
+
+function addScore(scoreMap, productId, score, reason) {
+  const id = toId(productId);
+  if (!id) return;
+
+  const current = scoreMap.get(id) || {
+    score: 0,
+    reasons: [],
+  };
+
+  current.score += score;
+
+  if (reason && !current.reasons.includes(reason)) {
+    current.reasons.push(reason);
+  }
+
+  scoreMap.set(id, current);
+}
+
+function getProductTags(product) {
+  return Array.isArray(product?.tags)
+    ? product.tags.map((tag) => String(tag).trim().toLowerCase()).filter(Boolean)
+    : [];
+}
+
+function getCategoryId(product) {
+  return toId(product?.categoryId);
+}
+
+function getBrand(product) {
+  return String(product?.brand || "").trim().toLowerCase();
+}
+
+function getGender(product) {
+  return String(product?.gender || "").trim().toLowerCase();
+}
+
+function hasSaleVariant(variants) {
+  return variants.some((variant) =>
+    Array.isArray(variant.sizes) &&
+    variant.sizes.some((size) => Number(size.discountPrice || 0) > 0)
+  );
+}
+
+function getVariantMinPrice(variants) {
+  let minOriginalPrice = Infinity;
+  let minFinalPrice = Infinity;
+  let selectedDiscountPrice = 0;
+
+  variants.forEach((variant) => {
+    (variant.sizes || []).forEach((size) => {
+      const price = Number(size.price || 0);
+      const discountPrice = Number(size.discountPrice || 0);
+      const finalPrice = discountPrice > 0 ? discountPrice : price;
+
+      if (finalPrice > 0 && finalPrice < minFinalPrice) {
+        minFinalPrice = finalPrice;
+        minOriginalPrice = price;
+        selectedDiscountPrice = discountPrice;
+      }
+    });
+  });
+
+  return {
+    price: minOriginalPrice === Infinity ? 0 : minOriginalPrice,
+    discountPrice: selectedDiscountPrice > 0 ? selectedDiscountPrice : undefined,
+    finalPrice: minFinalPrice === Infinity ? 0 : minFinalPrice,
+  };
+}
+
+function buildProductCardData(product, variants, extra = {}) {
+  const validVariants = variants.filter(
+    (variant) =>
+      Array.isArray(variant.sizes) &&
+      variant.sizes.some((size) => Number(size.stock || 0) > 0)
+  );
+
+  const usableVariants = validVariants.length ? validVariants : variants;
+
+  const defaultVariant =
+    usableVariants.find((variant) => Array.isArray(variant.images) && variant.images.length > 0) ||
+    usableVariants[0] ||
+    null;
+
+  const priceInfo = getVariantMinPrice(usableVariants);
+  const image =
+    defaultVariant?.images?.[0] ||
+    usableVariants.find((variant) => Array.isArray(variant.images) && variant.images.length > 0)?.images?.[0] ||
+    "/placeholder.svg";
+
+  const availableColors = [
+    ...new Set(usableVariants.map((variant) => variant.color).filter(Boolean)),
+  ];
+
+  const availableSizes = [
+    ...new Set(
+      usableVariants.flatMap((variant) =>
+        Array.isArray(variant.sizes)
+          ? variant.sizes.map((size) => size.size).filter(Boolean)
+          : []
+      )
+    ),
+  ];
+
+  const colorVariants = usableVariants.slice(0, 5).map((variant) => ({
+    color: variant.color || "",
+    colorCode: variant.colorCode || "#000000",
+    images: Array.isArray(variant.images) ? variant.images : [],
+    sizes: Array.isArray(variant.sizes)
+      ? variant.sizes.map((size) => ({
+          size: size.size,
+          sku: size.sku || "",
+          price: size.price || 0,
+          discountPrice: size.discountPrice || 0,
+          stock: size.stock || 0,
+          finalPrice:
+            Number(size.discountPrice || 0) > 0
+              ? Number(size.discountPrice || 0)
+              : Number(size.price || 0),
+        }))
+      : [],
+  }));
+
+  const totalStock = usableVariants.reduce((sum, variant) => {
+    if (!Array.isArray(variant.sizes)) return sum;
+    return (
+      sum +
+      variant.sizes.reduce(
+        (sizeSum, size) => sizeSum + Number(size.stock || 0),
+        0
+      )
+    );
+  }, 0);
+
+  return {
+    _id: product._id,
+    name: product.name,
+    slug: product.slug,
+    shortDescription: product.shortDescription,
+    brand: product.brand,
+    material: product.material,
+    gender: product.gender,
+    tags: product.tags || [],
+    categoryId: product.categoryId,
+    category: product.categoryId,
+    rating: product.rating,
+    images: image ? [image] : [],
+    price: priceInfo.price,
+    discountPrice: priceInfo.discountPrice,
+    finalPrice: priceInfo.finalPrice,
+    onSale: hasSaleVariant(usableVariants),
+    availableColors,
+    availableSizes,
+    colorVariants,
+    variants: usableVariants,
+    defaultVariant,
+    totalStock,
+    createdAt: product.createdAt,
+    ...extra,
+  };
+}
+
+async function enrichProductsForCards(products, extraByProductId = new Map()) {
+  if (!products.length) return [];
+
+  const productIds = products.map((product) => product._id);
+  const variants = await ProductVariant.find({ productId: { $in: productIds } }).lean();
+
+  const variantsByProduct = {};
+  variants.forEach((variant) => {
+    const key = String(variant.productId);
+    if (!variantsByProduct[key]) variantsByProduct[key] = [];
+    variantsByProduct[key].push(variant);
+  });
+
+  return products.map((product) => {
+    const productId = String(product._id);
+    return buildProductCardData(
+      product,
+      variantsByProduct[productId] || [],
+      extraByProductId.get(productId) || {}
+    );
+  });
+}
+
+exports.getForYouProducts = async (req, res) => {
+  try {
+    const userId = req.user?.id || req.user?._id || req.user?.userId;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Vui lòng đăng nhập để xem gợi ý dành cho bạn",
+        products: [],
+      });
+    }
+
+    const limit = Math.max(1, Math.min(20, Number(req.query.limit) || 10));
+
+    const [user, cart, recentViewDocs, userOrders] = await Promise.all([
+      User.findById(userId).select("wishlist orderHistory gender").lean(),
+
+      Cart.findOne({ userId })
+        .select("items.productId items.variantId items.quantity")
+        .lean(),
+
+      ProductRecentlyViewed.find({ userId })
+        .sort({ createdAt: -1 })
+        .limit(10)
+        .lean(),
+
+      Order.find({ userId })
+        .sort({ createdAt: -1 })
+        .limit(10)
+        .select("items.productId orderStatus createdAt")
+        .lean(),
+    ]);
+
+    const seedScoreMap = new Map();
+    const excludedProductIds = new Set();
+
+    const wishlistIds = Array.isArray(user?.wishlist)
+      ? user.wishlist.map(toId).filter(Boolean)
+      : [];
+
+    wishlistIds.forEach((productId) => {
+      addScore(seedScoreMap, productId, 10, "Từ sản phẩm yêu thích");
+    });
+
+    const cartProductIds = Array.isArray(cart?.items)
+      ? cart.items.map((item) => toId(item.productId)).filter(Boolean)
+      : [];
+
+    cartProductIds.forEach((productId) => {
+      addScore(seedScoreMap, productId, 12, "Từ giỏ hàng");
+      excludedProductIds.add(productId);
+    });
+
+    const orderProductIds = [];
+    userOrders.forEach((order) => {
+      (order.items || []).forEach((item) => {
+        const productId = toId(item.productId);
+        if (productId) orderProductIds.push(productId);
+      });
+    });
+
+    orderProductIds.forEach((productId) => {
+      addScore(seedScoreMap, productId, 8, "Từ lịch sử mua hàng");
+      excludedProductIds.add(productId);
+    });
+
+    const recentSlugs = [];
+    const recentProductIds = [];
+
+    recentViewDocs.forEach((doc) => {
+      (doc.products || []).forEach((item) => {
+        if (item.productId) recentProductIds.push(toId(item.productId));
+        if (item.slug) recentSlugs.push(String(item.slug));
+      });
+    });
+
+    let recentProductsBySlug = [];
+    if (recentSlugs.length) {
+      recentProductsBySlug = await Product.find({
+        slug: { $in: [...new Set(recentSlugs)] },
+        status: "active",
+      })
+        .select("_id")
+        .lean();
+    }
+
+    [
+      ...recentProductIds,
+      ...recentProductsBySlug.map((product) => toId(product._id)),
+    ].forEach((productId) => {
+      addScore(seedScoreMap, productId, 6, "Từ sản phẩm đã xem gần đây");
+    });
+
+    const seedIds = [...seedScoreMap.keys()];
+
+    if (!seedIds.length) {
+      const fallbackProducts = await Product.find({ status: "active" })
+        .populate("categoryId", "name slug")
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean();
+
+      const enrichedFallback = await enrichProductsForCards(
+        fallbackProducts,
+        new Map(
+          fallbackProducts.map((product) => [
+            String(product._id),
+            {
+              recommendationScore: 0,
+              recommendationReasons: ["Sản phẩm mới tại cửa hàng"],
+            },
+          ])
+        )
+      );
+
+      return res.json({
+        source: "fallback",
+        products: enrichedFallback,
+      });
+    }
+
+    const seedProducts = await Product.find({
+      _id: { $in: seedIds },
+      status: "active",
+    })
+      .populate("categoryId", "name slug")
+      .lean();
+
+    const seedProductsById = new Map(
+      seedProducts.map((product) => [String(product._id), product])
+    );
+
+    const categoryIds = [
+      ...new Set(seedProducts.map(getCategoryId).filter(Boolean)),
+    ];
+
+    const tags = [
+      ...new Set(seedProducts.flatMap(getProductTags)),
+    ];
+
+    const brands = [
+      ...new Set(seedProducts.map(getBrand).filter(Boolean)),
+    ];
+
+    const genders = [
+      ...new Set(seedProducts.map(getGender).filter(Boolean)),
+    ];
+
+    const cfScoreMap = new Map();
+
+    const cfDocs = await CFRecommendation.find({
+      product: { $in: seedIds },
+    }).lean();
+
+    cfDocs.forEach((doc) => {
+      (doc.recommendations || []).forEach((item) => {
+        const productId = toId(item.product);
+        if (!productId || seedIds.includes(productId)) return;
+
+        const score = Number(item.score || 0);
+        cfScoreMap.set(productId, (cfScoreMap.get(productId) || 0) + score);
+      });
+    });
+
+    const cfProductIds = [...cfScoreMap.keys()];
+
+    const candidateOr = [];
+
+    if (categoryIds.length) candidateOr.push({ categoryId: { $in: categoryIds } });
+    if (tags.length) candidateOr.push({ tags: { $in: tags } });
+    if (brands.length) candidateOr.push({ brand: { $in: brands } });
+    if (genders.length) candidateOr.push({ gender: { $in: genders } });
+    if (cfProductIds.length) candidateOr.push({ _id: { $in: cfProductIds } });
+
+    const candidateFilter = {
+      status: "active",
+      _id: { $nin: [...excludedProductIds] },
+      ...(candidateOr.length ? { $or: candidateOr } : {}),
+    };
+
+    let candidates = await Product.find(candidateFilter)
+      .populate("categoryId", "name slug")
+      .limit(80)
+      .lean();
+
+    if (!candidates.length) {
+      candidates = await Product.find({
+        status: "active",
+        _id: { $nin: [...excludedProductIds] },
+      })
+        .populate("categoryId", "name slug")
+        .sort({ createdAt: -1 })
+        .limit(30)
+        .lean();
+    }
+
+    const candidateIds = candidates.map((product) => product._id);
+    const candidateVariants = await ProductVariant.find({
+      productId: { $in: candidateIds },
+    }).lean();
+
+    const variantsByProduct = {};
+    candidateVariants.forEach((variant) => {
+      const key = String(variant.productId);
+      if (!variantsByProduct[key]) variantsByProduct[key] = [];
+      variantsByProduct[key].push(variant);
+    });
+
+    const scoredProducts = candidates
+      .map((candidate) => {
+        const candidateId = String(candidate._id);
+        const candidateCategory = getCategoryId(candidate);
+        const candidateTags = getProductTags(candidate);
+        const candidateBrand = getBrand(candidate);
+        const candidateGender = getGender(candidate);
+        const reasons = new Set();
+
+        let score = 0;
+
+        seedIds.forEach((seedId) => {
+          const seedProduct = seedProductsById.get(seedId);
+          if (!seedProduct) return;
+
+          const seedBaseScore = seedScoreMap.get(seedId)?.score || 1;
+
+          if (candidateCategory && candidateCategory === getCategoryId(seedProduct)) {
+            score += seedBaseScore;
+            reasons.add("Cùng danh mục với sản phẩm bạn quan tâm");
+          }
+
+          const seedTags = getProductTags(seedProduct);
+          const matchedTags = candidateTags.filter((tag) => seedTags.includes(tag));
+          if (matchedTags.length) {
+            score += matchedTags.length * 3;
+            reasons.add("Có tag tương tự sản phẩm bạn quan tâm");
+          }
+
+          if (candidateBrand && candidateBrand === getBrand(seedProduct)) {
+            score += 2;
+            reasons.add("Cùng thương hiệu");
+          }
+
+          if (candidateGender && candidateGender === getGender(seedProduct)) {
+            score += 2;
+            reasons.add("Phù hợp nhóm sản phẩm bạn hay xem");
+          }
+        });
+
+        if (cfScoreMap.has(candidateId)) {
+          score += Number(cfScoreMap.get(candidateId) || 0) * 10;
+          reasons.add("Dữ liệu gợi ý cộng tác");
+        }
+
+        const variants = variantsByProduct[candidateId] || [];
+        if (hasSaleVariant(variants)) {
+          score += 4;
+          reasons.add("Đang có ưu đãi");
+        }
+
+        score += Math.min(3, Number(candidate.rating?.average || 0) / 2);
+
+        return {
+          product: candidate,
+          score,
+          reasons: [...reasons],
+        };
+      })
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
+
+    let finalProducts = scoredProducts.map((item) => item.product);
+
+    if (finalProducts.length < limit) {
+      const existingIds = new Set(finalProducts.map((product) => String(product._id)));
+
+      const fallbackProducts = await Product.find({
+        status: "active",
+        _id: {
+          $nin: [...existingIds, ...excludedProductIds],
+        },
+      })
+        .populate("categoryId", "name slug")
+        .sort({ createdAt: -1 })
+        .limit(limit - finalProducts.length)
+        .lean();
+
+      finalProducts = [...finalProducts, ...fallbackProducts];
+    }
+
+    const extraByProductId = new Map();
+
+    scoredProducts.forEach((item) => {
+      extraByProductId.set(String(item.product._id), {
+        recommendationScore: Number(item.score.toFixed(2)),
+        recommendationReasons: item.reasons,
+      });
+    });
+
+    finalProducts.forEach((product) => {
+      const key = String(product._id);
+      if (!extraByProductId.has(key)) {
+        extraByProductId.set(key, {
+          recommendationScore: 0,
+          recommendationReasons: ["Sản phẩm mới tại cửa hàng"],
+        });
+      }
+    });
+
+    const enrichedProducts = await enrichProductsForCards(finalProducts, extraByProductId);
+
+    return res.json({
+      source: "personalized",
+      products: enrichedProducts,
+    });
+  } catch (error) {
+    console.error("getForYouProducts error:", error);
+    return res.status(500).json({
+      message: "Không thể tải gợi ý dành cho bạn",
+      error: error.message,
+      products: [],
+    });
+  }
+};
 
 exports.createProduct = async (req, res) => {
   try {

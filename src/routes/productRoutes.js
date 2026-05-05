@@ -17,6 +17,7 @@ router.get("/search", productController.searchProducts);
 router.get("/best-sellers", productController.getBestSellers);
 router.get("/new", productController.getNewProducts);
 router.get("/ml-recommend", productController.mlRecommend);
+router.get("/for-you", authMiddleware, productController.getForYouProducts);
 router.get("/variant/details", productController.getVariantDetails);
 
 // Product detail routes
