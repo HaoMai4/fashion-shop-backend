@@ -247,6 +247,10 @@ exports.socialLogin = async (req, res) => {
       await user.save();
     }
 
+    if (user.status && user.status !== "active") {
+      return res.status(401).json({ message: "Tài khoản không hoạt động" });
+    }
+
     const token = generateToken(user._id, user.role);
 
     return res.json({
