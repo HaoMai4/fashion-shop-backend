@@ -4,6 +4,9 @@ const router = express.Router();
 const {
   register,
   login,
+  forgotPassword,
+  resetPassword,
+  changePassword,
   getMe,
   updateMe,
   getAddresses,
@@ -32,6 +35,9 @@ router.post("/social-login", socialLogin);
 router.post("/register", register);
 router.post("/register-admin", authMiddleware, adminOnly, registerAdmin);
 router.post("/login", login);
+router.post("/forgot-password", forgotPassword);
+router.post("/reset-password", resetPassword);
+router.put("/change-password", authMiddleware, changePassword);
 router.get("/me", authMiddleware, getMe);
 router.put("/me", authMiddleware, updateMe);
 

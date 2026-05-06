@@ -398,6 +398,13 @@ exports.login = async (req, res) => {
       return res.status(400).json({ message: "Email không tồn tại" });
     }
 
+    if (!user.password) {
+      return res.status(400).json({
+        message:
+          "Tài khoản này chưa có mật khẩu. Vui lòng đăng nhập bằng Google hoặc dùng quên mật khẩu để thiết lập mật khẩu.",
+      });
+    }
+
     const isMatch = await comparePassword(password, user.password);
     if (!isMatch) {
       return res.status(400).json({ message: "Mật khẩu không đúng" });
@@ -427,13 +434,171 @@ exports.login = async (req, res) => {
   }
 };
 
+exports.forgotPassword = async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body.email);
+
+    if (!email) {
+      return res.status(400).json({ message: "Vui lòng nhập email" });
+    }
+
+    const user = await User.findOne({ email });
+
+    if (!user || (user.status && user.status !== "active")) {
+      return res.json({
+        message:
+          "Nếu email tồn tại trong hệ thống, mã OTP đặt lại mật khẩu sẽ được gửi.",
+      });
+    }
+
+    const otp = generateOtp();
+    saveOtp(email, otp);
+
+    await sendOtpMail(email, otp);
+
+    return res.json({
+      message: "Mã OTP đặt lại mật khẩu đã được gửi đến email của bạn",
+    });
+  } catch (error) {
+    console.error("forgotPassword error:", error);
+    return res.status(500).json({
+      message: error.message || "Không thể gửi OTP đặt lại mật khẩu",
+    });
+  }
+};
+
+exports.resetPassword = async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body.email);
+    const otp = String(req.body.otp || "").trim();
+    const newPassword = String(
+      req.body.newPassword || req.body.password || ""
+    );
+
+    if (!email || !otp || !newPassword) {
+      return res.status(400).json({
+        message: "Vui lòng nhập email, OTP và mật khẩu mới",
+      });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({
+        message: "Mật khẩu mới phải có ít nhất 6 ký tự",
+      });
+    }
+
+    const validOtp = verifyOtp(email, otp);
+
+    if (!validOtp) {
+      return res.status(400).json({
+        message: "OTP không hợp lệ hoặc đã hết hạn",
+      });
+    }
+
+    const user = await User.findOne({ email });
+
+    if (!user) {
+      return res.status(404).json({
+        message: "Không tìm thấy tài khoản",
+      });
+    }
+
+    if (user.status && user.status !== "active") {
+      return res.status(401).json({
+        message: "Tài khoản không hoạt động",
+      });
+    }
+
+    user.password = await hashPassword(newPassword);
+    await user.save();
+
+    return res.json({
+      message: "Đặt lại mật khẩu thành công. Vui lòng đăng nhập lại.",
+    });
+  } catch (error) {
+    console.error("resetPassword error:", error);
+    return res.status(500).json({
+      message: error.message || "Không thể đặt lại mật khẩu",
+    });
+  }
+};
+
+exports.changePassword = async (req, res) => {
+  try {
+    const currentPassword = String(req.body.currentPassword || "");
+    const newPassword = String(req.body.newPassword || "");
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({
+        message: "Vui lòng nhập mật khẩu hiện tại và mật khẩu mới",
+      });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({
+        message: "Mật khẩu mới phải có ít nhất 6 ký tự",
+      });
+    }
+
+    if (currentPassword === newPassword) {
+      return res.status(400).json({
+        message: "Mật khẩu mới không được trùng mật khẩu hiện tại",
+      });
+    }
+
+    const user = await User.findById(req.user.id);
+
+    if (!user) {
+      return res.status(404).json({
+        message: "Không tìm thấy tài khoản",
+      });
+    }
+
+    if (!user.password) {
+      return res.status(400).json({
+        message:
+          "Tài khoản này đang đăng nhập bằng Google và chưa có mật khẩu riêng. Bạn có thể dùng chức năng quên mật khẩu để thiết lập mật khẩu email nếu cần.",
+      });
+    }
+
+    const isMatch = await comparePassword(currentPassword, user.password);
+
+    if (!isMatch) {
+      return res.status(400).json({
+        message: "Mật khẩu hiện tại không đúng",
+      });
+    }
+
+    user.password = await hashPassword(newPassword);
+    await user.save();
+
+    return res.json({
+      message: "Đổi mật khẩu thành công",
+    });
+  } catch (error) {
+    console.error("changePassword error:", error);
+    return res.status(500).json({
+      message: error.message || "Không thể đổi mật khẩu",
+    });
+  }
+};
+
 exports.getMe = async (req, res) => {
   try {
-    const user = await User.findById(req.user.id).select("-password");
+    const user = await User.findById(req.user.id);
+
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
-    res.json(user);
+
+    const data = user.toObject();
+
+    data.hasPassword = !!user.password;
+    data.providers = (user.socialLogins || []).map((item) => item.provider);
+
+    delete data.password;
+
+    res.json(data);
   } catch (error) {
     console.error("getMe error:", error);
     res.status(500).json({ message: error.message });
