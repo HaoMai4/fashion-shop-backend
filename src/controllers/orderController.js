@@ -16,6 +16,7 @@ const { sendOrderCreatedEmail, sendOrderStatusUpdateEmail } = require("../servic
 const { sendOrderZNSByStatus } = require("../utils/zaloZNSUtil");
 const fs = require('fs');
 const path = require('path');
+const axios = require("axios");
 let puppeteer;
 try { puppeteer = require('puppeteer'); } catch (e) { puppeteer = null; }
 
@@ -23,6 +24,187 @@ try { puppeteer = require('puppeteer'); } catch (e) { puppeteer = null; }
 const PAYOS_CLIENT_ID = process.env.PAYOS_CLIENT_ID;
 const PAYOS_API_KEY = process.env.PAYOS_API_KEY;
 const PAYOS_CHECKSUM_KEY = process.env.PAYOS_CHECKSUM_KEY;
+
+const PAYOS_BASE_URL =
+  process.env.PAYOS_BASE_URL || "https://api-merchant.payos.vn";
+
+async function getPayOSPaymentInfo(orderCode) {
+  if (!PAYOS_CLIENT_ID || !PAYOS_API_KEY) {
+    throw new Error("PayOS chưa được cấu hình");
+  }
+
+  const response = await axios.get(
+    `${PAYOS_BASE_URL}/v2/payment-requests/${encodeURIComponent(orderCode)}`,
+    {
+      headers: {
+        "x-client-id": PAYOS_CLIENT_ID,
+        "x-api-key": PAYOS_API_KEY,
+      },
+    }
+  );
+
+  return response.data?.data || null;
+}
+
+async function markOrderPaid(order, sourceData = {}) {
+  if (!order) return null;
+
+  if (order.paymentMethod?.status === "paid") {
+    return order;
+  }
+
+  if (!order.paymentMethod) {
+    order.paymentMethod = {};
+  }
+
+  order.paymentMethod.status = "paid";
+  order.paymentMethod.paidAt = order.paymentMethod.paidAt || new Date();
+  order.paymentMethod.transactionId =
+    sourceData.transactionId ||
+    sourceData.paymentLinkId ||
+    sourceData.reference ||
+    sourceData.id ||
+    order.paymentMethod.transactionId;
+
+  if (order.orderStatus !== "cancelled") {
+    order.orderStatus = "confirmed";
+  }
+
+  try {
+    await decreaseStock(order.items);
+  } catch (err) {
+    console.error("decreaseStock error (PayOS paid):", err);
+  }
+
+  try {
+    if (order.voucher?.voucherId && !order.voucher?.redeemed) {
+      await redeemVoucherForOrder(order);
+    } else {
+      await order.save();
+    }
+  } catch (err) {
+    console.error("redeemVoucherForOrder error (PayOS paid):", err);
+    await order.save();
+  }
+
+  try {
+    const recipient = order.shippingAddress?.email || order.guestInfo?.email || null;
+
+    if (recipient) {
+      sendOrderCreatedEmail(order, recipient).catch((err) =>
+        console.warn("Send order email failed:", err)
+      );
+    }
+  } catch (err) {
+    console.warn("send order email error:", err);
+  }
+
+  return order;
+}
+
+async function markOrderCancelled(order, sourceData = {}) {
+  if (!order) return null;
+
+  if (order.paymentMethod?.status === "paid") {
+    return order;
+  }
+
+  if (!order.paymentMethod) {
+    order.paymentMethod = {};
+  }
+
+  order.paymentMethod.status = "cancelled";
+  order.paymentMethod.cancelledAt = order.paymentMethod.cancelledAt || new Date();
+  order.paymentMethod.transactionId =
+    sourceData.transactionId ||
+    sourceData.paymentLinkId ||
+    sourceData.reference ||
+    sourceData.id ||
+    order.paymentMethod.transactionId;
+
+  order.orderStatus = "cancelled";
+
+  if (order.userId) {
+    const cartItems = order.items.map((item) => ({
+      variantId: item.variantId,
+      productId: item.productId,
+      quantity: item.quantity,
+      size: item.size,
+      price: item.price,
+      discountPrice: item.discountPrice || item.price || 0,
+      finalPrice: item.finalPrice || item.price || 0,
+      name: item.name || "",
+    }));
+
+    await Cart.updateOne(
+      { userId: order.userId },
+      { $push: { items: { $each: cartItems } } },
+      { upsert: true }
+    );
+  }
+
+  await releaseVoucherForOrder(order);
+  await order.save();
+
+  return order;
+}
+
+async function syncOrderPaymentFromPayOS(order) {
+  if (!order) return null;
+
+  if (order.paymentMethod?.type !== "PayOS") {
+    return order;
+  }
+
+  if (["paid", "cancelled"].includes(order.paymentMethod?.status)) {
+    return order;
+  }
+
+  const payosData = await getPayOSPaymentInfo(order.orderCode);
+  const payosStatus = String(payosData?.status || "").toUpperCase();
+
+  console.log("PayOS status sync:", {
+    orderCode: order.orderCode,
+    payosStatus,
+    amount: payosData?.amount,
+    amountPaid: payosData?.amountPaid,
+  });
+
+  const paidAmount = Number(payosData?.amountPaid || payosData?.amount || 0);
+  const expectedAmount = Number(order.totalAmount || 0);
+
+  if (payosStatus === "PAID") {
+    if (paidAmount > 0 && expectedAmount > 0 && paidAmount < expectedAmount) {
+      console.warn("PayOS paid amount is less than order total:", {
+        orderCode: order.orderCode,
+        paidAmount,
+        expectedAmount,
+      });
+
+      return order;
+    }
+
+    return markOrderPaid(order, payosData);
+  }
+
+  if (payosStatus === "CANCELLED" || payosStatus === "CANCELED") {
+    return markOrderCancelled(order, payosData);
+  }
+
+  return order;
+}
+
+function buildPaymentStatusResponse(order) {
+  return {
+    orderCode: order.orderCode,
+    orderStatus: order.orderStatus,
+    paymentStatus: order.paymentMethod?.status || "pending",
+    totalAmount: order.totalAmount,
+    createdAt: order.createdAt,
+    paidAt: order.paymentMethod?.paidAt || null,
+    cancelledAt: order.paymentMethod?.cancelledAt || null,
+  };
+}
 
 // Helper: validate voucher and return snapshot { voucher, discount, snaps  hot }
 async function prepareVoucherSnapshot(voucherCode, orderItems, subtotal, shippingFee, userId) {
@@ -479,136 +661,99 @@ exports.createOrder = async (req, res) => {
 
 exports.handlePayOSWebhook = async (req, res) => {
   try {
-    const payload = req.body;
+    const payload = req.body || {};
+    const data = payload.data || payload;
+
     console.log("PayOS Webhook received:", payload);
-    const orderCode = payload.orderCode || payload.data?.orderCode;
-    const order = await Order.findOne({ orderCode });
+
+    const orderCode = data.orderCode || payload.orderCode;
+
+    if (!orderCode) {
+      return res.status(200).json({ message: "Webhook thiếu orderCode" });
+    }
+
+    let order = await Order.findOne({ orderCode });
+
     if (!order) {
-      console.log("Order not found:", payload.orderCode);
+      console.log("Order not found:", orderCode);
       return res.status(200).json({ message: "Không tìm thấy đơn" });
     }
 
-    if (order.paymentMethod.status === "paid" || order.paymentMethod.status === "cancelled") {
-      console.log("Order already processed:", order._id);
-      return res.json({ message: "Order already processed" });
+    if (["paid", "cancelled"].includes(order.paymentMethod?.status)) {
+      return res.json({
+        message: "Order already processed",
+        orderStatus: order.orderStatus,
+        paymentStatus: order.paymentMethod.status,
+      });
     }
 
-    if (payload.code === "00" || payload.status === "PAID") {
-      // success
-      order.paymentMethod.status = "paid";
-      order.orderStatus = "confirmed";
-      order.paymentMethod.paidAt = new Date();
+    const webhookStatus = String(data.status || payload.status || "").toUpperCase();
+    const isSuccess =
+      payload.code === "00" ||
+      data.code === "00" ||
+      payload.success === true ||
+      webhookStatus === "PAID";
 
-      // decrease stock (existing logic)
-      try {
-        await decreaseStock(order.items);
-      } catch (err) {
-        console.error("decreaseStock error:", err);
-        // proceed but log
-      }
+    const isCancelled =
+      webhookStatus === "CANCELLED" ||
+      webhookStatus === "CANCELED";
 
-      // redeem voucher in transaction to avoid race
-      if (order.voucher?.voucherId && !order.voucher?.redeemed) {
-        const session = await mongoose.startSession();
-        session.startTransaction();
-        try {
-          const v = await Voucher.findById(order.voucher.voucherId).session(session);
-          if (v) {
-            if (v.usageLimit !== null && v.usedCount >= v.usageLimit) {
-              console.warn("Voucher already exhausted at redeem time:", v.code);
-            } else {
-              v.usedCount = (v.usedCount || 0) + 1;
-              if (order.userId) {
-                const rec = v.usersUsed.find(u => u.user?.toString() === order.userId.toString());
-                if (rec) rec.count = (rec.count || 0) + 1;
-                else v.usersUsed.push({ user: order.userId, count: 1 });
-              }
-              await v.save({ session });
-              order.voucher.redeemed = true;
-              order.voucher.redeemedAt = new Date();
-              await order.save({ session });
-            }
-          } else {
-            // voucher not found: still mark order saved below
-            console.warn("Voucher referenced by order not found:", order.voucher.voucherId);
-            await order.save(); // save status without voucher changes
-          }
-          await session.commitTransaction();
-        } catch (err) {
-          await session.abortTransaction();
-          console.error("Voucher redeem transaction error:", err);
-          // don't block payment success; leave order.voucher.redeemed false for manual reconciliation
-          await order.save();
-        } finally {
-          session.endSession();
-        }
-      } else {
-        await order.save();
-      }
-
-      console.log("✅ Payment successful for order:", order._id);
-    } else if (payload.status === "CANCELLED") {
-      // cancelled
-      order.paymentMethod.status = "cancelled";
-      order.orderStatus = "cancelled";
-      order.paymentMethod.cancelledAt = new Date();
-
-      if (order.userId) {
-        const cartItems = order.items.map(item => ({
-          variantId: item.variantId,
-          quantity: item.quantity,
-          size: item.size,
-          price: item.price
-        }));
-        await Cart.updateOne(
-          { userId: order.userId },
-          { $push: { items: { $each: cartItems } } },
-          { upsert: true }
-        );
-      }
-
-      await order.save();
-      console.log("❌ Payment cancelled for order:", order._id);
+    if (isCancelled) {
+      order = await markOrderCancelled(order, data);
+    } else if (isSuccess) {
+      order = await markOrderPaid(order, data);
     } else {
-      // failed or other status
       order.paymentMethod.status = "failed";
       order.paymentMethod.failedAt = new Date();
+      order.paymentMethod.transactionId =
+        data.transactionId ||
+        data.paymentLinkId ||
+        payload.transactionId ||
+        payload.paymentLinkId ||
+        order.paymentMethod.transactionId;
+
       await order.save();
-      console.log("⚠️ Payment failed for order:", order._id);
     }
 
-    order.paymentMethod.transactionId = payload.transactionId || payload.paymentLinkId || order.paymentMethod.transactionId;
-    await order.save();
-
-    res.json({
+    return res.json({
       message: "Webhook handled successfully",
       orderStatus: order.orderStatus,
-      paymentStatus: order.paymentMethod.status
+      paymentStatus: order.paymentMethod.status,
     });
   } catch (error) {
     console.error("handlePayOSWebhook error:", error);
-    res.status(500).json({ message: "Webhook error" });
+    return res.status(500).json({ message: "Webhook error" });
   }
 };
 
 exports.checkPaymentStatus = async (req, res) => {
   try {
     const { orderCode } = req.params;
-    const order = await Order.findOne({ orderCode });
-    if (!order) return res.status(404).json({ message: "Không tìm thấy đơn hàng" });
 
-    res.json({
-      orderCode: order.orderCode,
-      orderStatus: order.orderStatus,
-      paymentStatus: order.paymentMethod.status,
-      totalAmount: order.totalAmount,
-      createdAt: order.createdAt,
-      paidAt: order.paymentMethod.paidAt || null,
-      cancelledAt: order.paymentMethod.cancelledAt || null
-    });
+    let order = await Order.findOne({ orderCode });
+
+    if (!order) {
+      return res.status(404).json({ message: "Không tìm thấy đơn hàng" });
+    }
+
+    if (
+      order.paymentMethod?.type === "PayOS" &&
+      order.paymentMethod?.status === "pending"
+    ) {
+      try {
+        order = await syncOrderPaymentFromPayOS(order);
+      } catch (err) {
+        console.warn(
+          "Không thể đồng bộ trạng thái PayOS, trả trạng thái hiện tại trong DB:",
+          err?.response?.data || err.message
+        );
+      }
+    }
+
+    return res.json(buildPaymentStatusResponse(order));
   } catch (error) {
     console.error("checkPaymentStatus error:", error);
-    res.status(500).json({ message: "Lỗi kiểm tra trạng thái" });
+    return res.status(500).json({ message: "Lỗi kiểm tra trạng thái" });
   }
 };
 
