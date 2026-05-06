@@ -3,7 +3,12 @@ const User = require("../models/User");
 const Product = require("../models/Product");
 const generateToken = require("../utils/generateToken");
 const { comparePassword, hashPassword } = require("../utils/hashPassword");
-const { generateOtp, saveOtp, verifyOtp } = require("../utils/otpService");
+const {
+  generateOtp,
+  saveOtp,
+  verifyOtp,
+  getOtpCooldown,
+} = require("../utils/otpService");
 const sendOtpMail = require("../utils/sendOtpMail");
 const admin = require("../config/firebase");
 
@@ -171,6 +176,12 @@ exports.socialLogin = async (req, res) => {
     } catch (e) {
       console.error("[SOCIAL] verifyIdToken failed:", e.errorInfo || e.message);
       return res.status(401).json({ message: "Invalid idToken", stage: "verify" });
+    }
+
+    if (decoded.email && decoded.email_verified === false) {
+      return res.status(401).json({
+        message: "Email Google chưa được xác thực",
+      });
     }
 
     const rawProvider = decoded.firebase?.sign_in_provider || "firebase";
@@ -451,6 +462,15 @@ exports.forgotPassword = async (req, res) => {
       });
     }
 
+    const cooldown = getOtpCooldown(email);
+
+    if (cooldown > 0) {
+      return res.status(429).json({
+        message: `Vui lòng chờ ${cooldown} giây trước khi gửi lại OTP`,
+        cooldown,
+      });
+    }
+
     const otp = generateOtp();
     saveOtp(email, otp);
 
@@ -458,9 +478,11 @@ exports.forgotPassword = async (req, res) => {
 
     return res.json({
       message: "Mã OTP đặt lại mật khẩu đã được gửi đến email của bạn",
+      cooldown: 60,
     });
   } catch (error) {
     console.error("forgotPassword error:", error);
+
     return res.status(500).json({
       message: error.message || "Không thể gửi OTP đặt lại mật khẩu",
     });
