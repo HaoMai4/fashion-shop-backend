@@ -53,6 +53,10 @@ async function markOrderPaid(order, sourceData = {}) {
     return order;
   }
 
+  const stockWasReserved =
+    isStockReservedStatus(order.orderStatus) ||
+    order.paymentMethod?.status === "paid";
+
   if (!order.paymentMethod) {
     order.paymentMethod = {};
   }
@@ -70,10 +74,21 @@ async function markOrderPaid(order, sourceData = {}) {
     order.orderStatus = "confirmed";
   }
 
-  try {
-    await decreaseStock(order.items);
-  } catch (err) {
-    console.error("decreaseStock error (PayOS paid):", err);
+  if (!stockWasReserved) {
+    try {
+      await decreaseStock(order.items);
+    } catch (err) {
+      console.error("decreaseStock error (PayOS paid):", err);
+
+      order.orderStatus = "reported";
+      order.paymentMethod.status = "paid";
+      order.paymentMethod.paidAt = order.paymentMethod.paidAt || new Date();
+      order.customerNote = `${order.customerNote || ""
+        }\n[Lỗi hệ thống] PayOS đã thanh toán nhưng không đủ tồn kho hoặc không thể trừ tồn kho. Cần admin xử lý thủ công.`;
+
+      await order.save();
+      return order;
+    }
   }
 
   try {
@@ -109,12 +124,17 @@ async function markOrderCancelled(order, sourceData = {}) {
     return order;
   }
 
+  const stockWasReserved =
+    isStockReservedStatus(order.orderStatus) ||
+    order.paymentMethod?.status === "paid";
+
   if (!order.paymentMethod) {
     order.paymentMethod = {};
   }
 
   order.paymentMethod.status = "cancelled";
-  order.paymentMethod.cancelledAt = order.paymentMethod.cancelledAt || new Date();
+  order.paymentMethod.cancelledAt =
+    order.paymentMethod.cancelledAt || new Date();
   order.paymentMethod.transactionId =
     sourceData.transactionId ||
     sourceData.paymentLinkId ||
@@ -123,6 +143,14 @@ async function markOrderCancelled(order, sourceData = {}) {
     order.paymentMethod.transactionId;
 
   order.orderStatus = "cancelled";
+
+  if (stockWasReserved) {
+    try {
+      await restoreStock(order.items);
+    } catch (err) {
+      console.error("restoreStock error (PayOS cancelled):", err);
+    }
+  }
 
   if (order.userId) {
     const cartItems = order.items.map((item) => ({
@@ -205,6 +233,18 @@ function buildPaymentStatusResponse(order) {
     cancelledAt: order.paymentMethod?.cancelledAt || null,
   };
 }
+
+const STOCK_RESERVED_ORDER_STATUSES = [
+  "confirmed",
+  "shipped",
+  "delivered",
+  "completed",
+];
+
+function isStockReservedStatus(status) {
+  return STOCK_RESERVED_ORDER_STATUSES.includes(status);
+}
+
 
 // Helper: validate voucher and return snapshot { voucher, discount, snaps  hot }
 async function prepareVoucherSnapshot(voucherCode, orderItems, subtotal, shippingFee, userId) {
@@ -880,6 +920,7 @@ exports.approveOrderReport = async (req, res) => {
     }
 
     const previousStatus = report.previousStatus || order.orderStatus;
+    const previousPaymentStatus = order.paymentMethod?.status;
 
     // mark cancelled
     order.orderStatus = 'cancelled';
@@ -887,9 +928,8 @@ exports.approveOrderReport = async (req, res) => {
     order.paymentMethod.status = 'cancelled';
     order.paymentMethod.cancelledAt = order.paymentMethod.cancelledAt || new Date();
 
-    const shouldRestoreStock = ["confirmed", "shipped", "delivered", "completed"].includes(
-      previousStatus
-    );
+    const shouldRestoreStock =
+      isStockReservedStatus(previousStatus) || previousPaymentStatus === "paid";
 
     if (shouldRestoreStock) {
       try {
@@ -1445,104 +1485,117 @@ exports.getOrdersAdmin = async (req, res) => {
 
 exports.updateOrderStatus = async (req, res) => {
   try {
-    if (req.user?.role !== "admin") return res.status(403).json({ message: "Forbidden" });
+    if (req.user?.role !== "admin") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
 
     const { id } = req.params;
-    const { orderStatus, paymentStatus } = req.body; // both optional
+    const { orderStatus, paymentStatus } = req.body;
 
-    const allowedStatuses = ["pending", "confirmed", "shipped", "delivered", "cancelled", "completed"];
+    const allowedStatuses = [
+      "pending",
+      "confirmed",
+      "shipped",
+      "delivered",
+      "cancelled",
+      "completed",
+    ];
     const allowedPayment = ["pending", "paid", "failed", "cancelled"];
 
     if (orderStatus && !allowedStatuses.includes(orderStatus)) {
       return res.status(400).json({ message: "orderStatus không hợp lệ" });
     }
+
     if (paymentStatus && !allowedPayment.includes(paymentStatus)) {
       return res.status(400).json({ message: "paymentStatus không hợp lệ" });
     }
 
     const order = await Order.findById(id);
-    if (!order) return res.status(404).json({ message: "Không tìm thấy đơn hàng" });
+
+    if (!order) {
+      return res.status(404).json({ message: "Không tìm thấy đơn hàng" });
+    }
 
     const prevOrderStatus = order.orderStatus;
     const prevPaymentStatus = order.paymentMethod?.status;
 
-    // If changing to paid (either via paymentStatus or orderStatus -> confirmed with paid)
-    const willBePaid = (paymentStatus === "paid") || (orderStatus === "confirmed" && prevPaymentStatus === "pending");
-
-    // If moving to cancelled
-    const willBeCancelled = orderStatus === "cancelled" || paymentStatus === "cancelled";
-
-    // Update requested fields
-    if (orderStatus) order.orderStatus = orderStatus;
-    if (paymentStatus) order.paymentMethod.status = paymentStatus;
-    const znsStatuses = [
-      "confirmed",
-      "completed",
-      "shipped",
-      "delivered",
-      "cancelled",
-    ];
-
-    if (znsStatuses.includes(orderStatus)) {
-      await sendZNS(order, orderStatus);
+    if (!order.paymentMethod) {
+      order.paymentMethod = {};
     }
-    // Handle paid flow: decrease stock and redeem voucher (similar to webhook)
-    if (willBePaid && prevPaymentStatus !== "paid") {
-      order.paymentMethod.paidAt = new Date();
+
+    const stockWasReserved =
+      isStockReservedStatus(prevOrderStatus) || prevPaymentStatus === "paid";
+
+    const nextOrderStatus = orderStatus || prevOrderStatus;
+    const nextPaymentStatus = paymentStatus || prevPaymentStatus;
+
+    const willBeCancelled =
+      nextOrderStatus === "cancelled" || nextPaymentStatus === "cancelled";
+
+    const willReserveStock =
+      !willBeCancelled &&
+      !stockWasReserved &&
+      (
+        isStockReservedStatus(nextOrderStatus) ||
+        nextPaymentStatus === "paid"
+      );
+
+    if (orderStatus) {
+      order.orderStatus = orderStatus;
+    }
+
+    if (paymentStatus) {
+      order.paymentMethod.status = paymentStatus;
+    }
+
+    if (willReserveStock) {
+      if (nextPaymentStatus === "paid") {
+        order.paymentMethod.paidAt =
+          order.paymentMethod.paidAt || new Date();
+      }
+
       try {
         await decreaseStock(order.items);
       } catch (err) {
         console.error("decreaseStock error (admin update):", err);
-        // continue
+        return res.status(400).json({
+          message:
+            err.message || "Không đủ tồn kho để cập nhật trạng thái đơn hàng",
+        });
       }
 
       if (order.voucher?.voucherId && !order.voucher?.redeemed) {
-        const session = await mongoose.startSession();
-        session.startTransaction();
         try {
-          const v = await Voucher.findById(order.voucher.voucherId).session(session);
-          if (v) {
-            if (v.usageLimit === null || v.usedCount < v.usageLimit) {
-              v.usedCount = (v.usedCount || 0) + 1;
-              if (order.userId) {
-                const rec = v.usersUsed?.find(u => u.user?.toString() === order.userId?.toString());
-                if (rec) rec.count = (rec.count || 0) + 1;
-                else v.usersUsed = [...(v.usersUsed || []), { user: order.userId, count: 1 }];
-              }
-              await v.save({ session });
-              order.voucher.redeemed = true;
-              order.voucher.redeemedAt = new Date();
-              await order.save({ session });
-            } else {
-              console.warn("Voucher already exhausted at admin redeem time:", v.code);
-              await order.save({ session });
-            }
-          } else {
-            await order.save({ session });
-          }
-          await session.commitTransaction();
+          await redeemVoucherForOrder(order);
         } catch (err) {
-          await session.abortTransaction();
-          console.error("Voucher redeem transaction error (admin):", err);
-          await order.save();
-        } finally {
-          session.endSession();
+          console.error("redeemVoucherForOrder error (admin update):", err);
+
+          if (willReserveStock) {
+            try {
+              await restoreStock(order.items);
+            } catch (restoreErr) {
+              console.error("restoreStock rollback error:", restoreErr);
+            }
+          }
+
+          return res.status(400).json({
+            message: err.message || "Không thể ghi nhận voucher cho đơn hàng",
+          });
         }
-      } else {
-        await order.save();
       }
     }
 
-    // Handle cancelled: restore stock and return items to user's cart
     if (willBeCancelled && prevOrderStatus !== "cancelled") {
-      try {
-        await restoreStock(order.items);
-      } catch (err) {
-        console.error("restoreStock error (admin cancel):", err);
+      if (stockWasReserved) {
+        try {
+          await restoreStock(order.items);
+        } catch (err) {
+          console.error("restoreStock error (admin cancel):", err);
+        }
       }
 
       if (order.userId) {
-        const cartItems = order.items.map(item => ({
+        const cartItems = order.items.map((item) => ({
           variantId: item.variantId,
           productId: item.productId,
           quantity: item.quantity,
@@ -1550,7 +1603,7 @@ exports.updateOrderStatus = async (req, res) => {
           price: item.price,
           discountPrice: item.discountPrice || item.price || 0,
           finalPrice: item.finalPrice || item.price || 0,
-          name: item.name || ""
+          name: item.name || "",
         }));
 
         try {
@@ -1567,16 +1620,16 @@ exports.updateOrderStatus = async (req, res) => {
       await releaseVoucherForOrder(order);
     }
 
-    // Handle completed: ensure payment is marked as paid and add to user's order history
-    const willBeCompleted = orderStatus === "completed" && prevOrderStatus !== "completed";
+    const willBeCompleted =
+      orderStatus === "completed" && prevOrderStatus !== "completed";
+
     if (willBeCompleted) {
-      // Đơn hàng hoàn tất phải đã thanh toán
       if (order.paymentMethod.status !== "paid") {
         order.paymentMethod.status = "paid";
-        order.paymentMethod.paidAt = order.paymentMethod.paidAt || new Date();
+        order.paymentMethod.paidAt =
+          order.paymentMethod.paidAt || new Date();
       }
 
-      // Thêm vào order history của user
       if (order.userId) {
         try {
           await User.updateOne(
@@ -1585,15 +1638,14 @@ exports.updateOrderStatus = async (req, res) => {
               $push: {
                 orderHistory: {
                   orderId: order._id,
-                  purchasedAt: new Date()
-                }
-              }
+                  purchasedAt: new Date(),
+                },
+              },
             }
           );
           console.log("✅ Order added to user history:", order._id);
         } catch (err) {
           console.error("Add to orderHistory error:", err);
-          // continue anyway
         }
       }
     }
@@ -1601,35 +1653,65 @@ exports.updateOrderStatus = async (req, res) => {
     order.updatedAt = new Date();
     await order.save();
 
-    // Gửi email thông báo cập nhật trạng thái
+    const znsStatuses = [
+      "confirmed",
+      "completed",
+      "shipped",
+      "delivered",
+      "cancelled",
+    ];
+
+    if (
+      orderStatus &&
+      znsStatuses.includes(orderStatus) &&
+      orderStatus !== prevOrderStatus
+    ) {
+      await sendZNS(order, orderStatus);
+    }
+
     try {
       const customerEmail = order.userId
         ? (await User.findById(order.userId))?.email
         : order.guestInfo?.email || order.shippingAddress?.email;
 
       if (customerEmail) {
-        // Gửi email nếu có thay đổi trạng thái đơn hàng
         if (orderStatus && orderStatus !== prevOrderStatus) {
-          await sendOrderStatusUpdateEmail(order, customerEmail, 'order', orderStatus);
-          console.log(`📧 Email cập nhật trạng thái đơn hàng đã gửi đến: ${customerEmail}`);
+          await sendOrderStatusUpdateEmail(
+            order,
+            customerEmail,
+            "order",
+            orderStatus
+          );
+          console.log(
+            `📧 Email cập nhật trạng thái đơn hàng đã gửi đến: ${customerEmail}`
+          );
         }
 
-        // Gửi email nếu có thay đổi trạng thái thanh toán
         if (paymentStatus && paymentStatus !== prevPaymentStatus) {
-          await sendOrderStatusUpdateEmail(order, customerEmail, 'payment', paymentStatus);
-          console.log(`📧 Email cập nhật trạng thái thanh toán đã gửi đến: ${customerEmail}`);
+          await sendOrderStatusUpdateEmail(
+            order,
+            customerEmail,
+            "payment",
+            paymentStatus
+          );
+          console.log(
+            `📧 Email cập nhật trạng thái thanh toán đã gửi đến: ${customerEmail}`
+          );
         }
       }
     } catch (emailError) {
       console.error("Lỗi khi gửi email thông báo:", emailError);
-      // Không throw error để không làm fail toàn bộ request
     }
 
-
-    res.json({ message: "Cập nhật trạng thái thành công", order });
+    return res.json({
+      message: "Cập nhật trạng thái thành công",
+      order,
+    });
   } catch (error) {
     console.error("updateOrderStatus error:", error);
-    res.status(500).json({ message: "Lỗi cập nhật trạng thái đơn hàng" });
+    return res.status(500).json({
+      message: "Lỗi cập nhật trạng thái đơn hàng",
+    });
   }
 };
 

@@ -28,10 +28,26 @@ async function hydrateItems(inputItems) {
     let sizeLabel = item.size || null;
 
     if (Array.isArray(variant.sizes) && variant.sizes.length) {
+      const quantity = Number(item.quantity || 0);
+
+      if (!quantity || quantity <= 0) {
+        throw new Error("Số lượng sản phẩm không hợp lệ");
+      }
+
       const matched = variant.sizes.find((s) =>
-        item.size ? s.size === item.size : s.stock > 0
+        item.size ? s.size === item.size : Number(s.stock || 0) > 0
       );
-      if (!matched) throw new Error(`Size ${item.size || ""} đã hết hàng`);
+
+      if (!matched) {
+        throw new Error(`Size ${item.size || ""} không khả dụng`);
+      }
+
+      if (Number(matched.stock || 0) < quantity) {
+        throw new Error(
+          `Size ${matched.size} chỉ còn ${matched.stock || 0} sản phẩm`
+        );
+      }
+
       sizeLabel = matched.size;
       price =
         matched.discountPrice && matched.discountPrice > 0
@@ -62,15 +78,45 @@ async function hydrateItems(inputItems) {
 async function decreaseStock(orderItems) {
   for (const item of orderItems) {
     const variant = await ProductVariant.findById(item.variantId);
-    if (!variant) continue;
+
+    if (!variant) {
+      throw new Error("Biến thể sản phẩm không tồn tại");
+    }
+
+    const quantity = Number(item.quantity || 0);
+
+    if (!quantity || quantity <= 0) {
+      throw new Error("Số lượng sản phẩm không hợp lệ");
+    }
 
     if (Array.isArray(variant.sizes) && variant.sizes.length && item.size) {
-      const sizeIndex = variant.sizes.findIndex(s => s.size === item.size);
-      if (sizeIndex !== -1) {
-        variant.sizes[sizeIndex].stock = Math.max(0, variant.sizes[sizeIndex].stock - item.quantity);
+      const sizeIndex = variant.sizes.findIndex((s) => s.size === item.size);
+
+      if (sizeIndex === -1) {
+        throw new Error(`Không tìm thấy size ${item.size}`);
       }
+
+      const currentStock = Number(variant.sizes[sizeIndex].stock || 0);
+
+      if (currentStock < quantity) {
+        throw new Error(
+          `Size ${item.size} chỉ còn ${currentStock} sản phẩm, không đủ để đặt ${quantity} sản phẩm`
+        );
+      }
+
+      variant.sizes[sizeIndex].stock = currentStock - quantity;
     } else if (variant.stock !== undefined) {
-      variant.stock = Math.max(0, variant.stock - item.quantity);
+      const currentStock = Number(variant.stock || 0);
+
+      if (currentStock < quantity) {
+        throw new Error(
+          `Sản phẩm chỉ còn ${currentStock}, không đủ để đặt ${quantity} sản phẩm`
+        );
+      }
+
+      variant.stock = currentStock - quantity;
+    } else {
+      throw new Error("Sản phẩm chưa có thông tin tồn kho");
     }
 
     await variant.save();
@@ -82,13 +128,21 @@ async function restoreStock(orderItems) {
     const variant = await ProductVariant.findById(item.variantId);
     if (!variant) continue;
 
+    const quantity = Number(item.quantity || 0);
+
+    if (!quantity || quantity <= 0) {
+      continue;
+    }
+
     if (Array.isArray(variant.sizes) && variant.sizes.length && item.size) {
-      const sizeIndex = variant.sizes.findIndex(s => s.size === item.size);
+      const sizeIndex = variant.sizes.findIndex((s) => s.size === item.size);
+
       if (sizeIndex !== -1) {
-        variant.sizes[sizeIndex].stock += item.quantity;
+        variant.sizes[sizeIndex].stock =
+          Number(variant.sizes[sizeIndex].stock || 0) + quantity;
       }
     } else if (variant.stock !== undefined) {
-      variant.stock += item.quantity;
+      variant.stock = Number(variant.stock || 0) + quantity;
     }
 
     await variant.save();
