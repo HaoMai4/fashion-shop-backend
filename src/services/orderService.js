@@ -7,6 +7,46 @@ const PAYOS_CLIENT_ID = process.env.PAYOS_CLIENT_ID;
 const PAYOS_API_KEY = process.env.PAYOS_API_KEY;
 const PAYOS_CHECKSUM_KEY = process.env.PAYOS_CHECKSUM_KEY;
 
+function isSaleActive(size) {
+  const price = Number(size?.price || 0);
+  const discountPrice = Number(size?.discountPrice || 0);
+
+  if (!price || !discountPrice || discountPrice >= price) {
+    return false;
+  }
+
+  const now = Date.now();
+
+  if (size?.saleStartAt) {
+    const startTime = new Date(size.saleStartAt).getTime();
+
+    if (!Number.isNaN(startTime) && now < startTime) {
+      return false;
+    }
+  }
+
+  if (size?.saleEndAt) {
+    const endTime = new Date(size.saleEndAt).getTime();
+
+    if (!Number.isNaN(endTime) && now > endTime) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function getFinalSizePrice(size) {
+  const price = Number(size?.price || 0);
+  const discountPrice = Number(size?.discountPrice || 0);
+
+  if (isSaleActive(size)) {
+    return discountPrice;
+  }
+
+  return price;
+}
+
 async function hydrateItems(inputItems) {
   const variantIds = inputItems.map(
     (item) => new mongoose.Types.ObjectId(item.variantId)
@@ -49,10 +89,7 @@ async function hydrateItems(inputItems) {
       }
 
       sizeLabel = matched.size;
-      price =
-        matched.discountPrice && matched.discountPrice > 0
-          ? matched.discountPrice
-          : matched.price;
+      price = getFinalSizePrice(matched);
     } else if (item.price) {
       price = item.price;
     }

@@ -34,6 +34,21 @@ function shortRandomCode(length = 4) {
   return Math.random().toString(36).slice(2, 2 + length).toUpperCase();
 }
 
+function normalizeNullableDate(value) {
+  if (value === undefined) return undefined;
+
+  if (value === null || value === "") {
+    return null;
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  return date;
+}
+
 async function generateSku({ productId, color, size }) {
   const product = await Product.findById(productId).select("name slug").lean();
 
@@ -76,6 +91,25 @@ async function normalizeSizesWithSku({ sizesArray, productId, color }) {
     } else {
       sizeItem.sku = String(sizeItem.sku).trim().toUpperCase();
     }
+
+    const normalizedSaleStartAt = normalizeNullableDate(sizeItem.saleStartAt);
+    const normalizedSaleEndAt = normalizeNullableDate(sizeItem.saleEndAt);
+
+    if (normalizedSaleStartAt !== undefined) {
+      sizeItem.saleStartAt = normalizedSaleStartAt;
+    }
+
+    if (normalizedSaleEndAt !== undefined) {
+      sizeItem.saleEndAt = normalizedSaleEndAt;
+    }
+
+    sizeItem.discountPrice = Number(sizeItem.discountPrice) || 0;
+    sizeItem.discountPercent = Number(sizeItem.discountPercent) || 0;
+    sizeItem.onSale =
+      sizeItem.onSale !== undefined
+        ? Boolean(sizeItem.onSale)
+        : sizeItem.discountPrice > 0;
+    sizeItem.saleNote = sizeItem.saleNote || "";
 
     result.push(sizeItem);
   }
@@ -329,9 +363,35 @@ exports.updateSizeInVariant = async (req, res) => {
       "discountPrice",
       "discountPercent",
       "onSale",
+      "saleStartAt",
+      "saleEndAt",
       "saleNote",
       "isDefault",
     ];
+
+    if (req.body.saleStartAt !== undefined) {
+      req.body.saleStartAt = normalizeNullableDate(req.body.saleStartAt);
+    }
+
+    if (req.body.saleEndAt !== undefined) {
+      req.body.saleEndAt = normalizeNullableDate(req.body.saleEndAt);
+    }
+
+    if (req.body.discountPrice !== undefined) {
+      req.body.discountPrice = Number(req.body.discountPrice) || 0;
+    }
+
+    if (req.body.discountPercent !== undefined) {
+      req.body.discountPercent = Number(req.body.discountPercent) || 0;
+    }
+
+    if (req.body.price !== undefined) {
+      req.body.price = Number(req.body.price) || 0;
+    }
+
+    if (req.body.stock !== undefined) {
+      req.body.stock = Number(req.body.stock) || 0;
+    }
 
     const updateFields = {};
     for (const key of allowed) {
@@ -564,19 +624,29 @@ exports.updateVariant = async (req, res) => {
         duplicatedSize.add(sizeKey);
       }
 
-      variant.sizes = sizesWithSku.map((size) => ({
-        size: size.size,
-        sku: size.sku || "",
-        stock: Number(size.stock) || 0,
-        price: Number(size.price) || 0,
-        originalPrice: Number(size.originalPrice) || 0,
-        discountPrice: Number(size.discountPrice) || 0,
-        discountPercent: Number(size.discountPercent) || 0,
-        onSale: Boolean(size.onSale) || false,
-        saleNote: size.saleNote || "",
-        isDefault: Boolean(size.isDefault) || false,
-        _id: size._id || new mongoose.Types.ObjectId(),
-      }));
+      variant.sizes = sizesWithSku.map((size) => {
+        const discountPrice = Number(size.discountPrice) || 0;
+        const price = Number(size.price) || 0;
+
+        return {
+          size: size.size,
+          sku: size.sku || "",
+          stock: Number(size.stock) || 0,
+          price,
+          originalPrice: Number(size.originalPrice) || 0,
+          discountPrice,
+          discountPercent: Number(size.discountPercent) || 0,
+          onSale:
+            size.onSale !== undefined
+              ? Boolean(size.onSale)
+              : discountPrice > 0 && discountPrice < price,
+          saleStartAt: normalizeNullableDate(size.saleStartAt) ?? null,
+          saleEndAt: normalizeNullableDate(size.saleEndAt) ?? null,
+          saleNote: size.saleNote || "",
+          isDefault: Boolean(size.isDefault) || false,
+          _id: size._id || new mongoose.Types.ObjectId(),
+        };
+      });
 
       console.log("After update - variant sizes:", variant.sizes);
     }

@@ -21,10 +21,12 @@ const productVariantSchema = new mongoose.Schema({
       stock: { type: Number, default: 0 },
       price: Number,
       originalPrice: Number,
-      discountPrice: Number,
-      discountPercent: Number,
-      onSale: Boolean,
-      saleNote: String,
+      discountPrice: { type: Number, default: 0 },
+      discountPercent: { type: Number, default: 0 },
+      onSale: { type: Boolean, default: false },
+      saleStartAt: { type: Date, default: null },
+      saleEndAt: { type: Date, default: null },
+      saleNote: { type: String, default: "" },
       isDefault: Boolean
     }
   ],

@@ -53,10 +53,63 @@ function getGender(product) {
   return String(product?.gender || "").trim().toLowerCase();
 }
 
+function isSaleActive(size) {
+  const price = Number(size?.price || 0);
+  const discountPrice = Number(size?.discountPrice || 0);
+
+  if (!price || !discountPrice || discountPrice >= price) {
+    return false;
+  }
+
+  const now = Date.now();
+
+  if (size?.saleStartAt) {
+    const startTime = new Date(size.saleStartAt).getTime();
+
+    if (!Number.isNaN(startTime) && now < startTime) {
+      return false;
+    }
+  }
+
+  if (size?.saleEndAt) {
+    const endTime = new Date(size.saleEndAt).getTime();
+
+    if (!Number.isNaN(endTime) && now > endTime) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function getSizePriceInfo(size) {
+  const price = Number(size?.price || 0);
+  const rawDiscountPrice = Number(size?.discountPrice || 0);
+  const activeSale = isSaleActive(size);
+
+  const discountPrice = activeSale ? rawDiscountPrice : 0;
+  const finalPrice = activeSale ? rawDiscountPrice : price;
+
+  return {
+    price,
+    discountPrice,
+    finalPrice,
+    originalPrice: activeSale ? price : undefined,
+    discountPercent: activeSale
+      ? Number(
+        size?.discountPercent ||
+        Math.round(((price - rawDiscountPrice) / price) * 100)
+      )
+      : 0,
+    onSale: activeSale,
+  };
+}
+
 function hasSaleVariant(variants) {
-  return variants.some((variant) =>
-    Array.isArray(variant.sizes) &&
-    variant.sizes.some((size) => Number(size.discountPrice || 0) > 0)
+  return variants.some(
+    (variant) =>
+      Array.isArray(variant.sizes) &&
+      variant.sizes.some((size) => getSizePriceInfo(size).onSale)
   );
 }
 
@@ -67,14 +120,12 @@ function getVariantMinPrice(variants) {
 
   variants.forEach((variant) => {
     (variant.sizes || []).forEach((size) => {
-      const price = Number(size.price || 0);
-      const discountPrice = Number(size.discountPrice || 0);
-      const finalPrice = discountPrice > 0 ? discountPrice : price;
+      const priceInfo = getSizePriceInfo(size);
 
-      if (finalPrice > 0 && finalPrice < minFinalPrice) {
-        minFinalPrice = finalPrice;
-        minOriginalPrice = price;
-        selectedDiscountPrice = discountPrice;
+      if (priceInfo.finalPrice > 0 && priceInfo.finalPrice < minFinalPrice) {
+        minFinalPrice = priceInfo.finalPrice;
+        minOriginalPrice = priceInfo.price;
+        selectedDiscountPrice = priceInfo.discountPrice;
       }
     });
   });
@@ -125,17 +176,24 @@ function buildProductCardData(product, variants, extra = {}) {
     colorCode: variant.colorCode || "#000000",
     images: Array.isArray(variant.images) ? variant.images : [],
     sizes: Array.isArray(variant.sizes)
-      ? variant.sizes.map((size) => ({
-        size: size.size,
-        sku: size.sku || "",
-        price: size.price || 0,
-        discountPrice: size.discountPrice || 0,
-        stock: size.stock || 0,
-        finalPrice:
-          Number(size.discountPrice || 0) > 0
-            ? Number(size.discountPrice || 0)
-            : Number(size.price || 0),
-      }))
+      ? variant.sizes.map((size) => {
+        const priceInfo = getSizePriceInfo(size);
+
+        return {
+          _id: size._id,
+          size: size.size,
+          sku: size.sku || "",
+          price: priceInfo.price,
+          discountPrice: priceInfo.discountPrice,
+          discountPercent: priceInfo.discountPercent,
+          onSale: priceInfo.onSale,
+          saleStartAt: size.saleStartAt || null,
+          saleEndAt: size.saleEndAt || null,
+          saleNote: size.saleNote || "",
+          stock: Number(size.stock || 0),
+          finalPrice: priceInfo.finalPrice,
+        };
+      })
       : [],
   }));
 
@@ -1470,10 +1528,12 @@ exports.getProductDetailsBySlug = async (req, res) => {
 
       // tính toán giá & stock
       variant.sizes.forEach(s => {
-        const finalPrice = s.discountPrice && s.discountPrice > 0 ? s.discountPrice : s.price;
-        if (finalPrice < minPrice) minPrice = finalPrice;
+        const priceInfo = getSizePriceInfo(s);
+        const finalPrice = priceInfo.finalPrice;
+
+        if (finalPrice > 0 && finalPrice < minPrice) minPrice = finalPrice;
         if (finalPrice > maxPrice) maxPrice = finalPrice;
-        totalStock += s.stock;
+        totalStock += Number(s.stock || 0);
       });
     });
 
@@ -1489,13 +1549,24 @@ exports.getProductDetailsBySlug = async (req, res) => {
         color: v.color,
         colorCode: v.colorCode,
         images: v.images,
-        sizes: v.sizes.map(s => ({
-          size: s.size,
-          price: s.price,
-          discountPrice: s.discountPrice,
-          stock: s.stock,
-          finalPrice: s.discountPrice && s.discountPrice > 0 ? s.discountPrice : s.price
-        }))
+        sizes: v.sizes.map(s => {
+          const priceInfo = getSizePriceInfo(s);
+
+          return {
+            _id: s._id,
+            size: s.size,
+            sku: s.sku || "",
+            price: priceInfo.price,
+            discountPrice: priceInfo.discountPrice,
+            discountPercent: priceInfo.discountPercent,
+            onSale: priceInfo.onSale,
+            saleStartAt: s.saleStartAt || null,
+            saleEndAt: s.saleEndAt || null,
+            saleNote: s.saleNote || "",
+            stock: Number(s.stock || 0),
+            finalPrice: priceInfo.finalPrice,
+          };
+        })
       })),
       availableColors,
       availableSizes,
@@ -1886,15 +1957,24 @@ exports.getVariantDetails = async (req, res) => {
       ? variant.sizes.find((s) => s.size.toLowerCase() === size.toLowerCase())
       : null;
 
-    const formattedSizes = variant.sizes.map((s) => ({
-      size: s.size,
-      price: s.price,
-      discountPrice: s.discountPrice,
-      stock: s.stock,
-      finalPrice:
-        s.discountPrice && s.discountPrice > 0 ? s.discountPrice : s.price,
-      onSale: s.onSale,
-    }));
+    const formattedSizes = variant.sizes.map((s) => {
+      const priceInfo = getSizePriceInfo(s);
+
+      return {
+        _id: s._id,
+        size: s.size,
+        sku: s.sku || "",
+        price: priceInfo.price,
+        discountPrice: priceInfo.discountPrice,
+        discountPercent: priceInfo.discountPercent,
+        onSale: priceInfo.onSale,
+        saleStartAt: s.saleStartAt || null,
+        saleEndAt: s.saleEndAt || null,
+        saleNote: s.saleNote || "",
+        stock: Number(s.stock || 0),
+        finalPrice: priceInfo.finalPrice,
+      };
+    });
 
     const response = {
       product: {
@@ -1915,17 +1995,24 @@ exports.getVariantDetails = async (req, res) => {
         sizes: formattedSizes,
       },
       selectedSize: sizeInfo
-        ? {
-          size: sizeInfo.size,
-          price: sizeInfo.price,
-          discountPrice: sizeInfo.discountPrice,
-          stock: sizeInfo.stock,
-          finalPrice:
-            sizeInfo.discountPrice && sizeInfo.discountPrice > 0
-              ? sizeInfo.discountPrice
-              : sizeInfo.price,
-          onSale: sizeInfo.onSale,
-        }
+        ? (() => {
+          const priceInfo = getSizePriceInfo(sizeInfo);
+
+          return {
+            _id: sizeInfo._id,
+            size: sizeInfo.size,
+            sku: sizeInfo.sku || "",
+            price: priceInfo.price,
+            discountPrice: priceInfo.discountPrice,
+            discountPercent: priceInfo.discountPercent,
+            onSale: priceInfo.onSale,
+            saleStartAt: sizeInfo.saleStartAt || null,
+            saleEndAt: sizeInfo.saleEndAt || null,
+            saleNote: sizeInfo.saleNote || "",
+            stock: Number(sizeInfo.stock || 0),
+            finalPrice: priceInfo.finalPrice,
+          };
+        })()
         : null,
     };
 
