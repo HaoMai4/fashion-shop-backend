@@ -91,6 +91,23 @@ async function markOrderPaid(order, sourceData = {}) {
     }
   }
 
+  if (order.userId) {
+    try {
+      await Cart.updateOne(
+        { userId: order.userId },
+        {
+          $pull: {
+            items: {
+              variantId: { $in: order.items.map((item) => item.variantId) },
+            },
+          },
+        }
+      );
+    } catch (err) {
+      console.error("Clear cart after PayOS paid error:", err);
+    }
+  }
+
   try {
     if (order.voucher?.voucherId && !order.voucher?.redeemed) {
       await redeemVoucherForOrder(order);
@@ -152,7 +169,7 @@ async function markOrderCancelled(order, sourceData = {}) {
     }
   }
 
-  if (order.userId) {
+  if (order.userId && stockWasReserved) {
     const cartItems = order.items.map((item) => ({
       variantId: item.variantId,
       productId: item.productId,
@@ -188,15 +205,25 @@ async function syncOrderPaymentFromPayOS(order) {
     return order;
   }
 
-  const payosData = await getPayOSPaymentInfo(order.orderCode);
-  const payosStatus = String(payosData?.status || "").toUpperCase();
+  let payosData = null;
+  let payosStatus = "";
 
-  console.log("PayOS status sync:", {
-    orderCode: order.orderCode,
-    payosStatus,
-    amount: payosData?.amount,
-    amountPaid: payosData?.amountPaid,
-  });
+  try {
+    payosData = await getPayOSPaymentInfo(order.orderCode);
+    payosStatus = String(payosData?.status || "").toUpperCase();
+
+    console.log("PayOS status sync:", {
+      orderCode: order.orderCode,
+      payosStatus,
+      amount: payosData?.amount,
+      amountPaid: payosData?.amountPaid,
+    });
+  } catch (err) {
+    console.warn(
+      "Không thể lấy trạng thái từ PayOS:",
+      err?.response?.data || err.message
+    );
+  }
 
   const paidAmount = Number(payosData?.amountPaid || payosData?.amount || 0);
   const expectedAmount = Number(order.totalAmount || 0);
@@ -219,6 +246,20 @@ async function syncOrderPaymentFromPayOS(order) {
     return markOrderCancelled(order, payosData);
   }
 
+  if (
+    order.paymentMethod?.expiresAt &&
+    new Date(order.paymentMethod.expiresAt).getTime() < Date.now()
+  ) {
+    order.paymentMethod.status = "cancelled";
+    order.paymentMethod.cancelledAt =
+      order.paymentMethod.cancelledAt || new Date();
+    order.orderStatus = "cancelled";
+    order.customerNote = `${order.customerNote || ""}\n[Hệ thống] Đơn hàng đã bị hủy do quá hạn thanh toán PayOS.`;
+
+    await order.save();
+    return order;
+  }
+
   return order;
 }
 
@@ -229,8 +270,38 @@ function buildPaymentStatusResponse(order) {
     paymentStatus: order.paymentMethod?.status || "pending",
     totalAmount: order.totalAmount,
     createdAt: order.createdAt,
+    expiresAt: order.paymentMethod?.expiresAt || null,
+    invoiceUrl: order.paymentMethod?.invoiceUrl || null,
     paidAt: order.paymentMethod?.paidAt || null,
     cancelledAt: order.paymentMethod?.cancelledAt || null,
+  };
+}
+
+async function attachLatestCancellationReport(order) {
+  if (!order) return order;
+
+  const plainOrder =
+    typeof order.toObject === "function" ? order.toObject() : order;
+
+  const report = await OrderReport.findOne({
+    orderId: plainOrder._id,
+  })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  return {
+    ...plainOrder,
+    cancellationReport: report
+      ? {
+        _id: report._id,
+        status: report.status,
+        reason: report.reason,
+        rejectReason: report.rejectReason,
+        previousStatus: report.previousStatus,
+        processedAt: report.processedAt,
+        createdAt: report.createdAt,
+      }
+      : null,
   };
 }
 
@@ -501,6 +572,7 @@ async function sendZNS(order, type) {
     console.error(`ZNS send error [${type}]`, err);
   }
 }
+
 exports.createOrder = async (req, res) => {
   try {
     const {
@@ -511,31 +583,51 @@ exports.createOrder = async (req, res) => {
       customerNote,
       returnUrl,
       cancelUrl,
-      voucherCode
+      voucherCode,
     } = req.body;
 
-    if (!items?.length) return res.status(400).json({ message: "Giỏ hàng trống" });
+    if (!items?.length) {
+      return res.status(400).json({ message: "Giỏ hàng trống" });
+    }
+
     if (!shippingAddress?.fullName || !shippingAddress?.phone) {
       return res.status(400).json({ message: "Thiếu thông tin giao hàng" });
     }
-    if (!shippingAddress?.email && !guestInfo?.email && !req.body.contactEmail) return res.status(400).json({ message: "Thiếu email liên hệ" });
+
+    if (!shippingAddress?.email && !guestInfo?.email && !req.body.contactEmail) {
+      return res.status(400).json({ message: "Thiếu email liên hệ" });
+    }
+
     if (!paymentMethod?.type) {
       return res.status(400).json({ message: "Thiếu phương thức thanh toán" });
     }
 
     const orderItems = await hydrateItems(items);
-    const subtotal = orderItems.reduce((sum, item) => sum + (item.price || 0) * (item.quantity || 0), 0);
+
+    const subtotal = orderItems.reduce(
+      (sum, item) => sum + (item.price || 0) * (item.quantity || 0),
+      0
+    );
+
     const shippingFee = Number(req.body.shippingFee || 0);
-
     const userId = req.user?.id || req.user?._id || req.user?.userId || null;
-    console.log("Auth header:", req.headers.authorization);
-    console.log("req.user:", userId);
 
-    // voucher handling
+    if (process.env.NODE_ENV !== "production") {
+      console.log("createOrder userId:", userId);
+    }
+
     let voucherSnapshot = null;
     let discount = 0;
+
     try {
-      const prepared = await prepareVoucherSnapshot(voucherCode, orderItems, subtotal, shippingFee, userId);
+      const prepared = await prepareVoucherSnapshot(
+        voucherCode,
+        orderItems,
+        subtotal,
+        shippingFee,
+        userId
+      );
+
       if (prepared) {
         voucherSnapshot = prepared.snapshot;
         discount = prepared.discount;
@@ -551,39 +643,53 @@ exports.createOrder = async (req, res) => {
       shippingAddress: {
         fullName: shippingAddress.fullName,
         phone: shippingAddress.phone,
-        email: guestInfo.email || req.body.contactEmail || shippingAddress.email || null,
-        addressLine1: shippingAddress.addressLine || shippingAddress.addressLine1 || "",
+        email:
+          guestInfo.email ||
+          req.body.contactEmail ||
+          shippingAddress.email ||
+          null,
+        addressLine1:
+          shippingAddress.addressLine || shippingAddress.addressLine1 || "",
         addressLine2: shippingAddress.addressLine2 || "",
         ward: shippingAddress.ward || "",
         district: shippingAddress.district || "",
         city: shippingAddress.city || "",
-        postalCode: shippingAddress.postalCode || ""
+        postalCode: shippingAddress.postalCode || "",
       },
       paymentMethod: {
         type: paymentMethod.type,
         status: "pending",
-        note: paymentMethod.note || ""
+        note: paymentMethod.note || "",
       },
       customerNote,
-      orderStatus: "pending",
+      orderStatus: paymentMethod.type === "PayOS" ? "pending_payment" : "pending",
       subtotal,
       shippingFee,
       discount,
       totalAmount,
-      voucher: voucherSnapshot || undefined
+      voucher: voucherSnapshot || undefined,
     };
 
-    if (userId) baseOrder.userId = userId;
-    else {
+    if (userId) {
+      baseOrder.userId = userId;
+    } else {
       const guestName = guestInfo.fullName || shippingAddress.fullName;
       const guestPhone = guestInfo.phone || shippingAddress.phone;
+
       if (!guestName || !guestPhone) {
-        return res.status(400).json({ message: "Khách vãng lai cần cung cấp họ tên và số điện thoại" });
+        return res.status(400).json({
+          message: "Khách vãng lai cần cung cấp họ tên và số điện thoại",
+        });
       }
+
       baseOrder.guestInfo = {
         fullName: guestName,
         phone: guestPhone,
-        email: guestInfo.email || req.body.contactEmail || shippingAddress.email || null
+        email:
+          guestInfo.email ||
+          req.body.contactEmail ||
+          shippingAddress.email ||
+          null,
       };
     }
 
@@ -608,19 +714,25 @@ exports.createOrder = async (req, res) => {
         });
       }
 
-      if (userId) {
+      if (userId && orderItems.length > 0) {
         await Cart.updateOne(
           { userId },
           {
             $pull: {
-              items: { variantId: { $in: orderItems.map((i) => i.variantId) } },
+              items: {
+                $or: orderItems.map((item) => ({
+                  variantId: item.variantId,
+                  size: item.size,
+                })),
+              },
             },
           }
         );
       }
 
       try {
-        const recipient = order.shippingAddress?.email || order.guestInfo?.email || null;
+        const recipient =
+          order.shippingAddress?.email || order.guestInfo?.email || null;
 
         if (recipient) {
           sendOrderCreatedEmail(order, recipient).catch((err) =>
@@ -634,14 +746,20 @@ exports.createOrder = async (req, res) => {
       return res.status(201).json({ order });
     }
 
-    // PayOS flow
     if (!PAYOS_CLIENT_ID || !PAYOS_API_KEY || !PAYOS_CHECKSUM_KEY) {
       return res.status(500).json({ message: "PayOS chưa được cấu hình" });
     }
 
     const orderCode = generateOrderCode();
-    const successUrl = returnUrl || `${process.env.CLIENT_URL || "http://localhost:3000"}/payment/success`;
-    const failUrl = cancelUrl || `${process.env.CLIENT_URL || "http://localhost:3000"}/payment/cancel`;
+    const successUrl =
+      returnUrl ||
+      `${process.env.CLIENT_URL || "http://localhost:3000"}/payment/success`;
+
+    const failUrl =
+      cancelUrl ||
+      `${process.env.CLIENT_URL || "http://localhost:3000"}/payment/cancel`;
+
+    const payosExpiredAt = Math.floor(Date.now() / 1000) + 15 * 60;
 
     const paymentBody = {
       orderCode,
@@ -650,52 +768,54 @@ exports.createOrder = async (req, res) => {
       returnUrl: successUrl,
       cancelUrl: failUrl,
       buyerName: shippingAddress.fullName,
-      buyerEmail: baseOrder.guestInfo?.email || "customer@example.com",
+      buyerEmail:
+        baseOrder.guestInfo?.email ||
+        baseOrder.shippingAddress?.email ||
+        "customer@example.com",
       buyerPhone: shippingAddress.phone,
-      buyerAddress: shippingAddress.addressLine1 || "",
-      items: orderItems.map(item => ({ name: item.name, quantity: item.quantity, price: item.price })),
-      expiredAt: Math.floor(Date.now() / 1000) + 900
+      buyerAddress: baseOrder.shippingAddress?.addressLine1 || "",
+      items: orderItems.map((item) => ({
+        name: item.name,
+        quantity: item.quantity,
+        price: item.price,
+      })),
+      expiredAt: payosExpiredAt,
     };
 
     let paymentData;
+
     try {
       paymentData = await createPayOSPayment(paymentBody);
     } catch (err) {
       console.error("PayOS create link error:", err?.response?.data || err.message);
-      return res.status(502).json({ message: "Không tạo được liên kết thanh toán PayOS" });
+
+      return res.status(502).json({
+        message: "Không tạo được liên kết thanh toán PayOS",
+      });
     }
 
     baseOrder.orderCode = orderCode;
-    baseOrder.paymentMethod.transactionId = paymentData.data?.orderCode || paymentData.data?.paymentLinkId || null;
+    baseOrder.paymentMethod.transactionId =
+      paymentData.data?.orderCode || paymentData.data?.paymentLinkId || null;
     baseOrder.paymentMethod.invoiceUrl = paymentData.data?.checkoutUrl;
-    baseOrder.paymentMethod.expiresAt = paymentData.data?.expiredAt ? new Date(paymentData.data.expiredAt * 1000) : null;
+    baseOrder.paymentMethod.expiresAt = new Date(payosExpiredAt * 1000);
 
     const order = await Order.create(baseOrder);
-
-    // DO NOT send email here for PayOS — wait for webhook confirmation
-    // Optional: if you want client to force finalize immediately, use req.body.finalize as before
-    const finalize = !!req.body.finalize;
-    if (userId && finalize === true) {
-      await Cart.updateOne(
-        { userId },
-        {
-          $pull: {
-            items: { variantId: { $in: orderItems.map((i) => i.variantId) } },
-          },
-        }
-      );
-    }
 
     return res.status(201).json({
       order,
       payment: {
         checkoutUrl: paymentData.data?.checkoutUrl,
-        qrCode: paymentData.data?.qrCode || null
-      }
+        qrCode: paymentData.data?.qrCode || null,
+      },
     });
   } catch (error) {
     console.error("createOrder error:", error);
-    res.status(500).json({ message: error.message, stack: error.stack });
+
+    return res.status(500).json({
+      message: error.message,
+      stack: error.stack,
+    });
   }
 };
 
@@ -983,6 +1103,13 @@ exports.rejectOrderReport = async (req, res) => {
     const { id } = req.params;
     const adminId = req.user?.id;
     const { reason } = req.body || {};
+    const rejectReason = String(reason || "").trim();
+
+    if (!rejectReason) {
+      return res.status(400).json({
+        message: "Vui lòng nhập lý do từ chối yêu cầu hủy đơn",
+      });
+    }
 
     const report = await OrderReport.findById(id);
 
@@ -1009,10 +1136,7 @@ exports.rejectOrderReport = async (req, res) => {
     report.status = "rejected";
     report.processedBy = adminId;
     report.processedAt = new Date();
-
-    if (reason) {
-      report.rejectReason = String(reason).trim();
-    }
+    report.rejectReason = rejectReason;
 
     await order.save();
     await report.save();
@@ -1031,38 +1155,53 @@ exports.rejectOrderReport = async (req, res) => {
 exports.getMyOrders = async (req, res) => {
   try {
     const userId = req.user?.id;
-    if (!userId) return res.status(401).json({ message: "Unauthorized" });
 
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const all = String(req.query.all || "").toLowerCase() === "true";
     const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(100, parseInt(req.query.limit) || 10);
-    const status = req.query.status; // optional: filter by orderStatus
+    const limit = all ? 0 : Math.min(100, parseInt(req.query.limit) || 20);
+    const status = req.query.status;
     const sortBy = req.query.sortBy || "createdAt";
     const sortOrder = req.query.sortOrder === "asc" ? 1 : -1;
 
     const filter = { userId };
-    if (status) filter.orderStatus = status;
+
+    if (status) {
+      filter.orderStatus = status;
+    }
 
     const total = await Order.countDocuments(filter);
-    const orders = await Order.find(filter)
+
+    const query = Order.find(filter)
       .sort({ [sortBy]: sortOrder })
-      .skip((page - 1) * limit)
-      .limit(limit)
       .populate("items.productId", "name slug")
       .populate("items.variantId", "color colorCode sizes images")
       .lean();
 
-    res.json({
+    if (!all) {
+      query.skip((page - 1) * limit).limit(limit);
+    }
+
+    const orders = await query;
+
+    return res.json({
       meta: {
         total,
-        page,
-        limit,
-        pages: Math.ceil(total / limit)
+        page: all ? 1 : page,
+        limit: all ? total : limit,
+        pages: all ? 1 : Math.ceil(total / limit),
+        all,
       },
-      data: orders
+      data: orders,
     });
   } catch (error) {
     console.error("getMyOrders error:", error);
-    res.status(500).json({ message: "Không lấy được danh sách đơn hàng" });
+    return res.status(500).json({
+      message: "Không lấy được danh sách đơn hàng",
+    });
   }
 };
 
@@ -1087,7 +1226,9 @@ exports.getMyOrderByCode = async (req, res) => {
       return res.status(404).json({ message: "Không tìm thấy đơn hàng" });
     }
 
-    return res.json({ data: order });
+    const orderWithReport = await attachLatestCancellationReport(order);
+
+    return res.json({ data: orderWithReport });
   } catch (error) {
     console.error("getMyOrderByCode error:", error);
     return res.status(500).json({ message: "Không lấy được chi tiết đơn hàng" });
@@ -1114,7 +1255,9 @@ exports.getOrderById = async (req, res) => {
       return res.status(404).json({ message: "Không tìm thấy đơn hàng" });
     }
 
-    return res.json({ data: order });
+    const orderWithReport = await attachLatestCancellationReport(order);
+
+    return res.json({ data: orderWithReport });
   } catch (error) {
     console.error("getOrderById error:", error);
     return res.status(500).json({ message: "Không lấy được đơn hàng" });
@@ -1135,7 +1278,9 @@ exports.getOrderByCode = async (req, res) => {
       return res.status(404).json({ message: "Không tìm thấy đơn hàng" });
     }
 
-    res.json(order);
+    const orderWithReport = await attachLatestCancellationReport(order);
+
+    res.json(orderWithReport);
   } catch (error) {
     console.error("getOrderByCode error:", error);
     res.status(500).json({ message: "Lỗi lấy thông tin đơn hàng" });
@@ -1594,7 +1739,7 @@ exports.updateOrderStatus = async (req, res) => {
         }
       }
 
-      if (order.userId) {
+      if (order.userId && stockWasReserved) {
         const cartItems = order.items.map((item) => ({
           variantId: item.variantId,
           productId: item.productId,

@@ -249,8 +249,8 @@ exports.createVoucher = async (req, res) => {
       usedCount: Number(data.usedCount || 0),
       perUserLimit:
         data.perUserLimit === null ||
-        data.perUserLimit === undefined ||
-        data.perUserLimit === ""
+          data.perUserLimit === undefined ||
+          data.perUserLimit === ""
           ? 1
           : Number(data.perUserLimit),
       applicableProducts: data.applicableProducts || [],
@@ -541,6 +541,11 @@ exports.getUserVouchers = async (req, res) => {
 
       const perUserUsed = usedRecord ? Number(usedRecord.count || 0) : 0;
 
+      const userRemainingUses =
+        v.perUserLimit === null || v.perUserLimit === undefined
+          ? null
+          : Math.max(0, Number(v.perUserLimit || 0) - perUserUsed);
+
       const exhausted =
         v.usageLimit !== null &&
         v.usageLimit !== undefined &&
@@ -570,6 +575,7 @@ exports.getUserVouchers = async (req, res) => {
         usedCount: v.usedCount || 0,
         perUserLimit: v.perUserLimit,
         perUserUsed,
+        userRemainingUses,
         exhausted,
         perUserExceeded,
         usable: !exhausted && !perUserExceeded,
