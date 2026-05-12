@@ -4,7 +4,9 @@ const ProductVariant = require("../models/ProductVariant");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const API_KEY = process.env.GOOGLE_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash-latest";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+
+
 const CHAT_DEBUG = process.env.CHAT_DEBUG === "1";
 
 let genAI = null;
@@ -25,7 +27,11 @@ function escapeRegex(str) {
 }
 
 function stripDiacritics(str) {
-  return (str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  return (str || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/đ/g, "d")
+    .replace(/Đ/g, "D");
 }
 
 function normalizeText(str) {
@@ -82,6 +88,21 @@ const SALE_TERMS = new Set([
   "ưu đãi",
   "uudai",
 ]);
+
+const META_INTENTS = new Set([
+  "capability_question",
+  "ai_working_explanation",
+  "privacy_memory_question",
+  "model_question",
+  "order_creation_question",
+]);
+
+const STORE_CATALOG_GUIDE = `
+Phạm vi sản phẩm hiện tại của MATEWEAR:
+- Ưu tiên tư vấn quanh các nhóm thời trang đang có khả năng bán trên website: áo thun, áo polo, áo sơ mi, áo khoác, quần short, quần dài, váy/chân váy nếu dữ liệu có sản phẩm nữ.
+- Với phụ kiện như mũ, kính, sandal, dép, đồ bơi: chỉ nhắc như món người dùng có thể tự chuẩn bị thêm nếu phù hợp hoàn cảnh, không nói rằng website đang bán nếu không có trong danh sách sản phẩm thật.
+- Không khẳng định MATEWEAR có bán một loại sản phẩm nếu backend không truyền sản phẩm đó trong "Sản phẩm thật từ database".
+`;
 
 const GREETING_TERMS = [
   "xin chao",
@@ -140,6 +161,30 @@ const OUTFIT_ADVICE_TERMS = [
   "dễ phối",
   "de phoi cung",
   "dễ phối cùng",
+  "di bien",
+  "đi biển",
+  "du lich",
+  "du lịch",
+  "nghi duong",
+  "nghỉ dưỡng",
+  "phong cach",
+  "phong cách",
+  "nang dong",
+  "năng động",
+  "ca tinh",
+  "cá tính",
+  "toi gian",
+  "tối giản",
+  "chon giup",
+  "chọn giúp",
+  "chon cho minh",
+  "chọn cho mình",
+  "vai mon",
+  "vài món",
+  "set do",
+  "set đồ",
+  "goi y set",
+  "gợi ý set",
 ];
 
 const CATEGORY_ALIASES = [
@@ -488,10 +533,259 @@ function buildBestDiscountReply(products) {
 
   return `Món đang giảm giá sâu nhất hiện tại là ${top.name}, từ ${formatVnd(oldPrice)} xuống còn ${formatVnd(newPrice)}, tương đương khoảng ${percent}%.`;
 }
+function includesAnyNormalized(text, terms) {
+  const normalized = normalizeText(text || "");
+  return terms.some((term) => normalized.includes(normalizeText(term)));
+}
 
+function detectMetaIntent(message) {
+  const text = normalizeText(message || "");
 
+  if (
+    includesAnyNormalized(text, [
+      "ban lam duoc gi",
+      "ban co the lam gi",
+      "ban ho tro gi",
+      "chuc nang cua ban",
+      "ban giup duoc gi",
+      "ai lam duoc gi",
+    ])
+  ) {
+    return "capability_question";
+  }
 
+  if (
+    includesAnyNormalized(text, [
+      "ban hoat dong nhu the nao",
+      "ban hieu cau hoi",
+      "ban xu ly du lieu",
+      "cach thuc ban lam viec",
+      "ban lam viec voi du lieu",
+      "khi minh hoi thi ban hieu",
+    ])
+  ) {
+    return "ai_working_explanation";
+  }
 
+  if (
+    includesAnyNormalized(text, [
+      "co luu lich su",
+      "luu lich su",
+      "lich su tro chuyen",
+      "bo nho",
+      "luu thong tin",
+      "luu lai thong tin",
+      "du lieu ca nhan",
+      "bao mat",
+    ])
+  ) {
+    return "privacy_memory_question";
+  }
+
+  if (
+    includesAnyNormalized(text, [
+      "mo hinh ai",
+      "model ai",
+      "dung model gi",
+      "su dung mo hinh",
+      "gemini",
+      "gpt",
+      "llm",
+    ])
+  ) {
+    return "model_question";
+  }
+
+  if (
+    includesAnyNormalized(text, [
+      "tao don",
+      "dat hang giup",
+      "dat don giup",
+      "mua hang giup",
+      "them vao gio",
+      "checkout giup",
+      "tao order",
+    ])
+  ) {
+    return "order_creation_question";
+  }
+
+  return null;
+}
+
+function buildMetaIntentReply(intent) {
+  if (intent === "capability_question") {
+    return [
+      "Mình là trợ lý tư vấn thời trang của MATEWEAR. Mình có thể hỗ trợ bạn:",
+      "- Tìm sản phẩm theo loại, màu, size, giá, sale.",
+      "- Tư vấn size dựa trên chiều cao và cân nặng.",
+      "- Gợi ý phối đồ theo hoàn cảnh như đi học, đi làm, đi chơi, đi biển, thể thao hoặc dự tiệc.",
+      "- Gợi ý sản phẩm đang có trên website để bạn xem chi tiết ở các thẻ sản phẩm bên dưới.",
+      "- Giải đáp nhanh các thông tin mua sắm như thanh toán, vận chuyển, đổi trả.",
+      "",
+      "Bạn có thể hỏi kiểu: “Nam đi biển nên phối gì?”, “Áo polo dưới 400k có mẫu nào?”, hoặc “Mình cao 1m72 nặng 65kg mặc size gì?”.",
+    ].join("\n");
+  }
+
+  if (intent === "ai_working_explanation") {
+    return [
+      "Khi bạn gửi câu hỏi, mình sẽ phân tích nội dung để xác định bạn đang cần gì: tìm sản phẩm, hỏi size, hỏi sale, phối đồ hay hỏi chính sách.",
+      "Sau đó mình tách các thông tin quan trọng như loại sản phẩm, màu sắc, size, khoảng giá, hoàn cảnh sử dụng và giới tính nếu bạn có nói.",
+      "Với câu hỏi liên quan sản phẩm, mình tìm trong dữ liệu sản phẩm của MATEWEAR rồi trả về gợi ý phù hợp. Với câu hỏi phối đồ, mình ưu tiên chọn các món có thể phối thành set để bạn xem chi tiết ở các thẻ sản phẩm bên dưới.",
+    ].join("\n");
+  }
+
+  if (intent === "privacy_memory_question") {
+    return [
+      "Hiện tại mình dùng thông tin trong cuộc trò chuyện và dữ liệu mua sắm cần thiết để hỗ trợ tư vấn trong phạm vi website.",
+      "Mình không tự ý tạo đơn hay thay đổi thông tin tài khoản của bạn. Các dữ liệu như sản phẩm đã xem, giỏ hàng, yêu thích hoặc đơn hàng chỉ được dùng để gợi ý mua sắm phù hợp hơn.",
+      "Nếu bạn cần thông tin chính sách bảo mật chính thức, bạn nên xem mục chính sách trên website hoặc liên hệ bộ phận hỗ trợ của MATEWEAR.",
+    ].join("\n");
+  }
+
+  if (intent === "model_question") {
+    return [
+      "Mình là trợ lý AI được tích hợp vào hệ thống MATEWEAR để hỗ trợ tư vấn thời trang và mua sắm.",
+      "Ở backend, hệ thống có thể dùng mô hình AI bên ngoài để hỗ trợ hiểu câu hỏi, sau đó kết hợp với dữ liệu sản phẩm thật trong database để trả lời.",
+      "Mình không công khai khóa API hay cấu hình nội bộ, nhưng có thể giải thích ở mức nghiệp vụ: phân tích câu hỏi, tìm sản phẩm phù hợp, rồi trả lời bằng ngôn ngữ dễ hiểu.",
+    ].join("\n");
+  }
+
+  if (intent === "order_creation_question") {
+    return [
+      "Hiện tại mình chưa tạo đơn hàng trực tiếp thay bạn.",
+      "Mình có thể gợi ý sản phẩm phù hợp để bạn mở trang chi tiết từ thẻ sản phẩm, chọn màu, size, số lượng rồi thêm vào giỏ hàng hoặc mua ngay trên website.",
+      "Cách này giúp bạn kiểm tra lại thông tin sản phẩm và địa chỉ trước khi đặt đơn.",
+    ].join("\n");
+  }
+
+  return null;
+}
+
+async function generateAssistantReply({
+  userMessage,
+  conversationText,
+  intent,
+  products = [],
+  filters = {},
+  metrics = {},
+  styleContext = null,
+  sizeSuggestion = null,
+}) {
+  if (!genAI) return null;
+
+  try {
+    const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
+
+    const productContextLimit = intent === "outfit_advice" ? 4 : 8;
+
+    const productContext = products.slice(0, productContextLimit).map((p, index) => ({
+      index: index + 1,
+      name: p.name,
+      gender: p.gender || null,
+      material: p.material || null,
+      price: p.finalPrice,
+      originalPrice: p.originalPrice,
+      discountPrice: p.discountPrice,
+      discountPercent: p.discountPercent,
+      category: p.category?.name || p.category?.slug || null,
+      brand: p.brand || null,
+      colors: p.availableColors || [],
+      sizes: p.availableSizes || [],
+      tags: p.tags || [],
+      shortDescription: p.shortDescription || "",
+      outfitReason: p.outfitReason || "",
+    }));
+
+    const systemInstruction = `
+Bạn là Stylist AI của MATEWEAR, một website thời trang.
+
+${STORE_CATALOG_GUIDE}
+
+Vai trò:
+- Tư vấn thời trang, tìm sản phẩm, gợi ý size, phối đồ, giải thích thông tin mua sắm.
+- Trả lời tự nhiên như stylist, thân thiện vừa đủ, không quá dài, không máy móc.
+- Ưu tiên tư vấn có lý do: vì sao phối như vậy, hợp hoàn cảnh nào, nên chọn màu/chất liệu/form ra sao.
+- Khi có dữ liệu gender, material, màu, size, category hoặc shortDescription, hãy dùng các thông tin đó để tư vấn cụ thể hơn.
+
+Quy tắc bắt buộc:
+- Chỉ nhắc tên sản phẩm nếu sản phẩm nằm trong danh sách "Sản phẩm thật từ database".
+- Không bịa sản phẩm, giá, màu, size, tồn kho hoặc chính sách.
+- Khi chỉ tư vấn phong cách chung và không có sản phẩm được backend truyền vào, hãy dùng các cụm như "bạn có thể chuẩn bị", "nên ưu tiên", "có thể phối", không nói "MATEWEAR có" hoặc "shop có".
+- Không liệt kê quá nhiều món ngoài phạm vi catalog hiện tại. Ưu tiên tư vấn sát với nhóm áo, quần, váy/chân váy, áo khoác nhẹ.
+- Không ghi link dạng /san-pham/slug trong nội dung trả lời, vì giao diện đã có thẻ sản phẩm bên dưới.
+- Nếu có sản phẩm phù hợp và intent liên quan đến sản phẩm, có thể nói người dùng xem các sản phẩm bên dưới.
+- Với câu hỏi meta như bạn làm được gì, hoạt động thế nào, mô hình AI, dữ liệu/bộ nhớ, không nhắc đến sản phẩm bên dưới nếu không có sản phẩm.
+- Nếu không có sản phẩm phù hợp, vẫn tư vấn định hướng chung và hỏi thêm thông tin.
+- Nếu người dùng hỏi tạo đơn, nói hiện chưa tạo đơn trực tiếp, chỉ hỗ trợ gợi ý sản phẩm để người dùng tự chọn.
+- Nếu người dùng hỏi mô hình AI, trả lời ở mức nghiệp vụ, không nói khóa API hoặc cấu hình kỹ thuật nội bộ.
+- Nếu người dùng hỏi dữ liệu/bộ nhớ, trả lời thận trọng: chỉ dùng dữ liệu cần thiết để hỗ trợ mua sắm trong phạm vi hệ thống.
+- Hạn chế emoji, tối đa 1 emoji nếu thật sự cần.
+- Không dùng giọng quảng cáo quá đà hoặc khẩu hiệu như "xả hơi", "tự tin khoe cá tính", "lên đồ cực cháy".
+- Giọng văn nên giống stylist tư vấn thật: tự nhiên, rõ ý, có lý do chọn chất liệu, form, màu và hoàn cảnh sử dụng.
+- Trả lời bằng tiếng Việt.
+- Không liệt kê quá nhiều câu hỏi cùng lúc. Mỗi phản hồi chỉ hỏi thêm tối đa 2 thông tin quan trọng nhất.
+- Chỉ nhắc chất liệu nếu trường material hoặc shortDescription của sản phẩm có thông tin đó. Không tự đoán chất liệu như cotton, linen, thun lạnh nếu dữ liệu không có.
+- Nếu user nói "vài món", "chọn giúp", "phối set", hãy trả lời gọn, tối đa 3 đến 4 bullet sản phẩm, mỗi bullet nêu lý do chọn ngắn gọn.
+- Với outfit_advice, có thể dùng bullet ngắn để giải thích vì sao chọn từng sản phẩm, vì thẻ sản phẩm bên dưới không có mô tả chi tiết. Mỗi bullet chỉ nên 1 câu ngắn, không quá dài.
+- Nếu có nhiều sản phẩm cùng một nhóm, ví dụ toàn áo, hãy nói rõ đây là các lựa chọn áo chính phù hợp và hỏi người dùng có muốn lọc thêm quần hoặc áo khoác để hoàn thiện set không.
+
+Cách trả lời theo intent:
+- capability_question: giới thiệu khả năng, kèm vài ví dụ câu hỏi.
+- ai_working_explanation: giải thích cách phân tích câu hỏi và dùng dữ liệu sản phẩm thật.
+- privacy_memory_question: nói rõ không tự ý tạo đơn/thay đổi tài khoản, dữ liệu mua sắm chỉ dùng để hỗ trợ tư vấn.
+- order_creation_question: nói chưa tạo đơn trực tiếp, hướng dẫn người dùng chọn sản phẩm trên website.
+- outfit_advice: tư vấn như stylist theo hoàn cảnh và dựng thành 1 set rõ ràng. Nếu có sản phẩm thật từ database, chỉ chọn tối đa 3 đến 4 món tiêu biểu, không liệt kê hết tất cả sản phẩm. Ưu tiên nói theo vai trò: áo chính, quần, áo khoác nhẹ hoặc món bổ sung nếu có. Giải thích ngắn vì sao set này hợp hoàn cảnh.
+- search_products/sale_products: tóm tắt kết quả tìm được bằng giọng tự nhiên, nhắc 1 đến 3 điểm nổi bật như giá, sale, màu, size nếu có dữ liệu, rồi gợi ý cách lọc tiếp theo.
+- size_advice: tư vấn size dựa trên chiều cao/cân nặng, nhắc đây là gợi ý tham khảo.
+- date_question: trả lời ngày/thứ ngắn gọn nếu backend đã cung cấp ngày trong filters hoặc metrics; không gợi ý sản phẩm nếu người dùng chỉ hỏi ngày.
+- weather_question: nếu không có dữ liệu thời tiết thời gian thực, nói rõ là hiện chưa có dữ liệu real-time; có thể tư vấn trang phục theo khí hậu chung hoặc hỏi người dùng cung cấp nhiệt độ/nắng/mưa.
+- fashion_advice: tư vấn như stylist trước, không tìm sản phẩm ngay nếu người dùng chỉ đang nêu bối cảnh. Với địa điểm biển như Phú Quốc, gợi ý đồ nhẹ, thoáng, dễ vận động như áo thun, sơ mi ngắn tay, quần short, áo khoác chống nắng mỏng. Phụ kiện chỉ nhắc là món có thể tự chuẩn bị thêm nếu cần.
+- Với fashion_advice, trả lời bằng 1 đến 2 đoạn ngắn, sau đó hỏi thêm tối đa 2 câu.
+- Không dùng các cụm thân mật hơi gượng như "bạn nhỉ", "xả hơi", "tự tin khoe cá tính", "lên đồ cực cháy".
+- Ưu tiên cách nói trực tiếp: "Mình gợi ý bạn...", "Bạn nên ưu tiên...", "Các màu... sẽ dễ phối...".
+`;
+
+    const prompt = `
+Câu hỏi hiện tại:
+${userMessage}
+
+Ngữ cảnh hội thoại gần đây:
+${conversationText || userMessage}
+
+Intent:
+${intent}
+
+Style context:
+${JSON.stringify(styleContext || {}, null, 2)}
+
+Size suggestion:
+${JSON.stringify(sizeSuggestion || null, null, 2)}
+
+Filters/backend hiểu được:
+${JSON.stringify(filters || {}, null, 2)}
+
+Metrics:
+${JSON.stringify(metrics || {}, null, 2)}
+
+Sản phẩm thật từ database:
+${JSON.stringify(productContext, null, 2)}
+
+Hãy viết câu trả lời cuối cho khách hàng.
+`;
+
+    const result = await model.generateContent([systemInstruction, prompt]);
+    const text = result?.response?.text?.() || "";
+
+    return text.trim() || null;
+  } catch (error) {
+    if (CHAT_DEBUG) {
+      console.warn("generateAssistantReply error:", error.message);
+    }
+
+    return null;
+  }
+}
 
 function answerPolicyQuestion(message) {
   const text = normalizeText(message);
@@ -566,13 +860,154 @@ function isOutfitAdviceQuestion(message) {
     text.includes("du tiec") ||
     text.includes("sinh nhat") ||
     text.includes("di lam") ||
-    text.includes("di choi");
+    text.includes("di choi") ||
+    text.includes("di bien") ||
+    text.includes("du lich") ||
+    text.includes("nghi duong");
 
-  return hasOutfitSignal || hasContextSignal;
+  const hasStyleSelectionSignal =
+    text.includes("chon giup") ||
+    text.includes("chon cho minh") ||
+    text.includes("vai mon") ||
+    text.includes("phong cach") ||
+    text.includes("nang dong") ||
+    text.includes("ca tinh") ||
+    text.includes("toi gian") ||
+    text.includes("lich su") ||
+    text.includes("tre trung") ||
+    text.includes("set do") ||
+    text.includes("goi y set");
+
+  const hasFashionTarget =
+    text.includes("nam") ||
+    text.includes("nu") ||
+    text.includes("ao") ||
+    text.includes("quan") ||
+    text.includes("do") ||
+    text.includes("trang phuc");
+
+  return (
+    hasOutfitSignal ||
+    hasContextSignal ||
+    (hasStyleSelectionSignal && hasFashionTarget)
+  );
+}
+
+function isTravelContextMessage(message) {
+  const text = normalizeText(message || "");
+
+  const hasTravelPlace =
+    text.includes("phu quoc") ||
+    text.includes("da lat") ||
+    text.includes("nha trang") ||
+    text.includes("da nang") ||
+    text.includes("hoi an") ||
+    text.includes("vung tau") ||
+    text.includes("di bien") ||
+    text.includes("du lich") ||
+    text.includes("nghi duong");
+
+  const hasTravelPlanCue =
+    text.includes("minh dinh di") ||
+    text.includes("toi dinh di") ||
+    text.includes("sap di") ||
+    text.includes("chuan bi di") ||
+    text.includes("du dinh di") ||
+    text.includes("cuoi tuan di") ||
+    text.includes("di phu quoc") ||
+    text.includes("di da lat") ||
+    text.includes("di nha trang") ||
+    text.includes("di da nang") ||
+    text.includes("di bien");
+
+  const hasProductBuyingCue =
+    text.includes("mua") ||
+    text.includes("san pham") ||
+    text.includes("ao") ||
+    text.includes("quan") ||
+    text.includes("vay") ||
+    text.includes("polo") ||
+    text.includes("so mi") ||
+    text.includes("thun") ||
+    text.includes("sale") ||
+    text.includes("gia") ||
+    text.includes("duoi") ||
+    text.includes("tren");
+
+  return hasTravelPlace && hasTravelPlanCue && !hasProductBuyingCue;
 }
 
 function inferIntentHeuristic(userMessage, parsedIntent = null) {
   const text = normalizeText(userMessage);
+
+  if (META_INTENTS.has(parsedIntent)) {
+    return parsedIntent;
+  }
+
+  if (parsedIntent === "policy_faq") {
+    return "policy_faq";
+  }
+
+  if (parsedIntent === "greeting") {
+    return "greeting";
+  }
+
+  const isDateQuestion =
+    text.includes("hom nay la thu may") ||
+    text.includes("hom nay thu may") ||
+    text.includes("hom nay ngay may") ||
+    text.includes("hom nay la ngay may") ||
+    text.includes("ngay may") ||
+    text.includes("thu may") ||
+    text.includes("bay gio la ngay may") ||
+    text.includes("bay gio la thu may");
+
+  if (isDateQuestion || parsedIntent === "date_question") {
+    return "date_question";
+  }
+
+  const isWeatherQuestion =
+    text.includes("thoi tiet") ||
+    text.includes("troi mua") ||
+    text.includes("troi nang") ||
+    text.includes("nhiet do") ||
+    text.includes("nong khong") ||
+    text.includes("lanh khong");
+
+  if (isWeatherQuestion || parsedIntent === "weather_question") {
+    return "weather_question";
+  }
+
+  const isTravelFashionAdvice =
+    (
+      text.includes("phu quoc") ||
+      text.includes("da lat") ||
+      text.includes("nha trang") ||
+      text.includes("da nang") ||
+      text.includes("hoi an") ||
+      text.includes("vung tau") ||
+      text.includes("du lich") ||
+      text.includes("di bien") ||
+      text.includes("mua nay")
+    ) &&
+    (
+      text.includes("mac gi") ||
+      text.includes("nen mac") ||
+      text.includes("phoi do") ||
+      text.includes("outfit")
+    );
+
+  if (
+    isTravelFashionAdvice ||
+    isTravelContextMessage(userMessage) ||
+    parsedIntent === "fashion_advice"
+  ) {
+    return "fashion_advice";
+  }
+
+  if (parsedIntent === "outfit_advice") {
+    return "outfit_advice";
+  }
 
   if (isGreetingOnly(userMessage)) {
     return "greeting";
@@ -615,9 +1050,6 @@ function inferIntentHeuristic(userMessage, parsedIntent = null) {
   if ([...SALE_TERMS].some((term) => text.includes(normalizeText(term)))) {
     return "sale_products";
   }
-
-  if (parsedIntent === "greeting") return "greeting";
-  if (parsedIntent === "outfit_advice") return "outfit_advice";
 
   return "search_products";
 }
@@ -828,12 +1260,13 @@ async function callGeminiForFilters(userMessage) {
     const systemInstruction = `
 Bạn là bộ phân tích truy vấn tìm sản phẩm thời trang. Chỉ trả JSON hợp lệ:
 {
- "intent":"search_products"|"size_advice"|"sale_products"|"outfit_advice"|"greeting"|"other",
+ "intent":"search_products"|"size_advice"|"sale_products"|"outfit_advice"|"greeting"|"policy_faq"|"capability_question"|"ai_working_explanation"|"privacy_memory_question"|"model_question"|"order_creation_question"|"date_question"|"weather_question"|"fashion_advice"|"other",
  "keywords": string[]|null,
  "categorySlug": string|null,
  "brand": string|null,
  "color": string|null,
  "size": string|null,
+ "gender":"nam"|"nu"|"unisex"|null,
  "minPrice": number|null,
  "maxPrice": number|null,
  "sortBy":"price"|"relevance"|"discount"|null,
@@ -843,7 +1276,23 @@ Chuyển k/ngàn/nghìn = *1000, triệu/tr = *1_000_000.
 Không đưa các từ chỉ giá như "dưới", "trên", "khoảng", "400k" vào keywords nếu đã hiểu thành min/max price.
 Nếu người dùng đang hỏi tư vấn size, đặt intent là "size_advice".
 Nếu người dùng hỏi sản phẩm sale / giảm giá, đặt intent là "sale_products".
-Nếu người dùng hỏi mặc gì, phối đồ, outfit, đi học, đi chơi, đi làm, dự tiệc, sinh nhật, quà tặng hoặc cần tư vấn theo hoàn cảnh, đặt intent là "outfit_advice".
+Nếu người dùng hỏi mặc gì, phối đồ, outfit, đi học, đi chơi, đi làm, dự tiệc, sinh nhật, quà tặng và có ý định xem/gợi ý sản phẩm cụ thể, đặt intent là "outfit_advice".
+Nếu người dùng nói "chọn giúp", "vài món", "phối set", "phong cách năng động", "phong cách cá tính", "tối giản", "lịch sự" và có nhắc đến nam/nữ/trang phục, đặt intent là "outfit_advice".
+Nếu người dùng hỏi tư vấn mặc gì theo địa điểm, mùa, thời tiết hoặc du lịch nhưng chưa yêu cầu sản phẩm cụ thể, đặt intent là "fashion_advice".
+Nếu người dùng nhắc nam, con trai, đàn ông, bạn trai, đặt gender là "nam".
+Nếu người dùng nhắc nữ, con gái, phụ nữ, bạn gái, đặt gender là "nu".
+Nếu người dùng nhắc unisex, đặt gender là "unisex".
+Nếu người dùng hỏi bạn làm được gì, hỗ trợ gì, chức năng gì, đặt intent là "capability_question".
+Nếu người dùng hỏi bạn hoạt động như thế nào, hiểu câu hỏi ra sao, xử lý dữ liệu thế nào, đặt intent là "ai_working_explanation".
+Nếu người dùng hỏi lưu lịch sử, bộ nhớ, dữ liệu cá nhân, bảo mật, đặt intent là "privacy_memory_question".
+Nếu người dùng hỏi dùng mô hình AI gì, model gì, Gemini/GPT/LLM, đặt intent là "model_question".
+Nếu người dùng hỏi tạo đơn, đặt hàng giúp, checkout giúp, đặt intent là "order_creation_question".
+Nếu người dùng hỏi đổi trả, vận chuyển, thanh toán, chính sách, đặt intent là "policy_faq".
+Nếu người dùng hỏi hôm nay ngày mấy, thứ mấy, ngày hiện tại, thời gian hiện tại, đặt intent là "date_question".
+Nếu người dùng hỏi thời tiết hiện tại, thời tiết ở một địa điểm, trời mưa/nắng/nóng/lạnh ở đâu đó, đặt intent là "weather_question".
+Nếu người dùng hỏi đi Phú Quốc, đi Đà Lạt, đi biển, du lịch mùa này nên mặc gì nhưng chưa yêu cầu sản phẩm cụ thể, đặt intent là "fashion_advice".
+Nếu người dùng chỉ nói đang định đi du lịch, sắp đi một địa điểm như Phú Quốc, Đà Lạt, Nha Trang, Đà Nẵng nhưng chưa hỏi mua sản phẩm cụ thể, đặt intent là "fashion_advice".
+Nếu người dùng chỉ cung cấp bối cảnh chuyến đi như "mình định đi Phú Quốc", hãy đặt intent là "fashion_advice", không đặt "search_products".
 Không thêm giải thích ngoài JSON.`;
 
     const prompt = `Người dùng: "${userMessage}"\nJSON:`;
@@ -862,12 +1311,35 @@ Không thêm giải thích ngoài JSON.`;
   }
 }
 
+function extractGenderFilterFromText(message) {
+  const text = normalizeText(message || "");
+
+  if (
+    /\b(nam|con trai|dan ong|ban trai|male)\b/.test(text)
+  ) {
+    return "nam";
+  }
+
+  if (
+    /\b(nu|nữ|con gai|phu nu|ban gai|female)\b/.test(text)
+  ) {
+    return "nu";
+  }
+
+  if (text.includes("unisex")) {
+    return "unisex";
+  }
+
+  return null;
+}
+
 async function fallbackParse(userMessage) {
   const lower = userMessage.toLowerCase();
   const color = normalizeColor(lower);
   const { minPrice, maxPrice } = extractPrices(lower);
   const size = extractSizes(lower);
   const { categorySlug, brand } = await semanticCategoryBrand(lower);
+  const gender = extractGenderFilterFromText(userMessage);
 
   let tokens = userMessage
     .split(/[\s,./\-+]+/)
@@ -883,6 +1355,7 @@ async function fallbackParse(userMessage) {
     brand: brand || null,
     color,
     size,
+    gender,
     minPrice: minPrice || null,
     maxPrice: maxPrice || null,
     sortBy: null,
@@ -959,6 +1432,41 @@ function scoreProduct(p, filters) {
   return score;
 }
 
+function normalizeProductGenderFilter(gender) {
+  const normalized = normalizeText(gender || "");
+
+  if (normalized === "nam" || normalized === "male") return "nam";
+  if (normalized === "nu" || normalized === "nữ" || normalized === "female") return "nu";
+  if (normalized === "unisex") return "unisex";
+
+  return null;
+}
+
+async function getCategoryAndDescendantIdsBySlug(categorySlug) {
+  if (!categorySlug) return [];
+
+  const rootCategory = await Category.findOne({ slug: categorySlug }).lean();
+  if (!rootCategory) return [];
+
+  const resultIds = [rootCategory._id];
+  let currentLevelIds = [rootCategory._id];
+
+  while (currentLevelIds.length) {
+    const children = await Category.find(
+      { parentId: { $in: currentLevelIds } },
+      "_id"
+    ).lean();
+
+    if (!children.length) break;
+
+    const childIds = children.map((item) => item._id);
+    resultIds.push(...childIds);
+    currentLevelIds = childIds;
+  }
+
+  return resultIds;
+}
+
 async function queryProducts(filters, pagination) {
   const {
     keywords,
@@ -971,18 +1479,33 @@ async function queryProducts(filters, pagination) {
     sortBy,
     sortOrder = "desc",
     saleOnly = false,
+    gender,
   } = filters;
 
   const { page = 1, limit = 30 } = pagination;
   const productFilter = { status: "active" };
+  const normalizedGender = normalizeProductGenderFilter(gender);
+
+  if (normalizedGender === "nam") {
+    productFilter.gender = { $in: ["nam", "unisex"] };
+  } else if (normalizedGender === "nu") {
+    productFilter.gender = { $in: ["nu", "unisex"] };
+  } else if (normalizedGender === "unisex") {
+    productFilter.gender = "unisex";
+  }
 
   function emptyResult() {
     return { total: 0, page, limit, products: [] };
   }
 
   if (categorySlug) {
-    const cat = await Category.findOne({ slug: categorySlug }).lean();
-    if (cat) productFilter.categoryId = cat._id;
+    const categoryIds = await getCategoryAndDescendantIdsBySlug(categorySlug);
+
+    if (!categoryIds.length) {
+      return emptyResult();
+    }
+
+    productFilter.categoryId = { $in: categoryIds };
   }
 
   if (brand) {
@@ -1162,6 +1685,8 @@ async function queryProducts(filters, pagination) {
       name: product.name,
       slug: product.slug,
       brand: product.brand,
+      gender: product.gender || "unisex",
+      material: product.material || "",
       shortDescription: product.shortDescription || "",
       tags: Array.isArray(product.tags) ? product.tags : [],
       category: product.categoryId,
@@ -1317,6 +1842,7 @@ function mergeFilters(prev, next) {
   if (next.brand) merged.brand = next.brand;
   if (next.color) merged.color = next.color;
   if (next.size) merged.size = next.size;
+  if (next.gender) merged.gender = next.gender;
 
   if (next.minPrice != null) merged.minPrice = next.minPrice;
   if (next.maxPrice != null) merged.maxPrice = next.maxPrice;
@@ -1332,6 +1858,7 @@ function hasCurrentProductAnchor(parsed) {
   return Boolean(
     parsed?.categorySlug ||
     parsed?.brand ||
+    parsed?.gender ||
     (Array.isArray(parsed?.keywords) && parsed.keywords.length > 0)
   );
 }
@@ -1511,15 +2038,20 @@ async function queryProductsWithRelaxation(filters, pagination) {
 function cleanParsedKeywordsInPlace(parsed) {
   parsed.keywords = cleanKeywordArray(parsed.keywords, parsed.color);
 }
+
 function extractStyleContext(message) {
   const text = normalizeText(message || "");
 
   let occasion = null;
   let customerType = null;
   let age = null;
+  let gender = null;
 
   const ageMatch = text.match(/\b(1[0-9]|2[0-9]|3[0-9]|4[0-9])\s*tuoi\b/);
   if (ageMatch) age = Number(ageMatch[1]);
+
+  if (/\b(nam|con trai|dan ong|ban trai)\b/.test(text)) gender = "nam";
+  else if (/\b(nu|nữ|con gai|phu nu|ban gai)\b/.test(text)) gender = "nu";
 
   if (text.includes("sinh vien")) customerType = "sinh viên";
   else if (text.includes("hoc sinh")) customerType = "học sinh";
@@ -1527,23 +2059,199 @@ function extractStyleContext(message) {
     customerType = "đi làm";
   }
 
-  if (text.includes("sinh nhat")) occasion = "dự tiệc sinh nhật";
-  else if (text.includes("du tiec")) occasion = "dự tiệc";
-  else if (text.includes("di hoc")) occasion = "đi học";
-  else if (text.includes("di lam")) occasion = "đi làm";
-  else if (text.includes("di choi") || text.includes("cuoi tuan")) {
+  if (text.includes("di bien")) occasion = "đi biển";
+  else if (text.includes("du lich") || text.includes("nghi duong")) {
+    occasion = "du lịch";
+  } else if (text.includes("sinh nhat")) {
+    occasion = "dự tiệc sinh nhật";
+  } else if (text.includes("du tiec")) {
+    occasion = "dự tiệc";
+  } else if (text.includes("di hoc")) {
+    occasion = "đi học";
+  } else if (text.includes("di lam")) {
+    occasion = "đi làm";
+  } else if (text.includes("di choi") || text.includes("cuoi tuan")) {
     occasion = "đi chơi";
-  } else if (text.includes("qua tang")) occasion = "quà tặng";
+  } else if (text.includes("qua tang")) {
+    occasion = "quà tặng";
+  }
 
   return {
     occasion,
     customerType,
     age,
+    gender,
   };
 }
 
-function getOutfitSearchPlans(message) {
+function mergeStyleContext(baseContext, currentContext) {
+  return {
+    occasion: currentContext.occasion || baseContext.occasion || null,
+    customerType: currentContext.customerType || baseContext.customerType || null,
+    age: currentContext.age || baseContext.age || null,
+    gender: currentContext.gender || baseContext.gender || null,
+  };
+}
+
+function getStyleContextForCurrentMessage(userMessage, conversationText) {
+  const historyContext = extractStyleContext(conversationText || userMessage);
+  const currentContext = extractStyleContext(userMessage);
+
+  return mergeStyleContext(historyContext, currentContext);
+}
+
+function getOutfitSearchPlans(message, styleContext = {}) {
   const text = normalizeText(message || "");
+  const genderFilter = styleContext.gender ? { gender: styleContext.gender } : {};
+  const isFemaleContext =
+    styleContext.gender === "nu" ||
+    text.includes("ban gai") ||
+    text.includes("con gai") ||
+    text.includes("phu nu");
+
+  const isMaleContext =
+    styleContext.gender === "nam" ||
+    text.includes("ban trai") ||
+    text.includes("con trai") ||
+    text.includes("dan ong");
+
+  const maleOnlyCategory = (slug) =>
+    styleContext.gender === "nu" ? null : slug;
+
+  const withOptionalCategory = (slug, extra = {}) => ({
+    ...extra,
+    ...(slug ? { categorySlug: slug } : {}),
+  });
+  const genderAwareCategory = (maleSlug) =>
+    styleContext.gender === "nu" ? "nu" : maleSlug;
+
+  if (
+    isFemaleContext &&
+    (
+      text.includes("qua tang") ||
+      text.includes("tang") ||
+      text.includes("di choi") ||
+      text.includes("cuoi tuan")
+    )
+  ) {
+    return [
+      {
+        label: "váy hoặc chân váy nữ dễ mặc khi đi chơi",
+        filters: {
+          intent: "search_products",
+          categorySlug: "nu",
+          gender: "nu",
+          keywords: ["váy", "chân váy"],
+        },
+      },
+      {
+        label: "áo nữ thanh lịch dễ tặng",
+        filters: {
+          intent: "search_products",
+          categorySlug: "nu",
+          gender: "nu",
+          keywords: ["sơ mi", "polo"],
+        },
+      },
+    ];
+  }
+
+  if (
+    isMaleContext &&
+    (
+      text.includes("qua tang") ||
+      text.includes("tang") ||
+      text.includes("di choi") ||
+      text.includes("cuoi tuan")
+    )
+  ) {
+    return [
+      {
+        label: "trang phục nam dễ mặc khi đi chơi",
+        filters: {
+          intent: "search_products",
+          categorySlug: "nam",
+          gender: "nam",
+          keywords: null,
+        },
+      },
+    ];
+  }
+
+  if (
+    text.includes("nang dong") ||
+    text.includes("the thao") ||
+    text.includes("active") ||
+    text.includes("sport") ||
+    text.includes("tre trung")
+  ) {
+    return [
+      {
+        label: "áo thun hoặc áo thể thao năng động",
+        filters: {
+          intent: "search_products",
+          categorySlug: styleContext.gender === "nu" ? "nu" : "ao-thun-nam",
+          keywords: ["thun", "thể thao"],
+          ...genderFilter,
+        },
+      },
+      {
+        label: "áo polo dễ vận động",
+        filters: {
+          intent: "search_products",
+          categorySlug: styleContext.gender === "nu" ? "nu" : "ao-polo-nam",
+          keywords: ["polo"],
+          ...genderFilter,
+        },
+      },
+      {
+        label: "áo khoác trẻ trung",
+        filters: {
+          intent: "search_products",
+          keywords: ["khoác", "bomber"],
+          ...genderFilter,
+        },
+      },
+      {
+        label: "quần short dễ phối",
+        filters: {
+          intent: "search_products",
+          categorySlug: "quan-short",
+          keywords: ["short"],
+          ...genderFilter,
+        },
+      },
+    ];
+  }
+
+  if (text.includes("di bien") || text.includes("du lich") || text.includes("nghi duong")) {
+    return [
+      {
+        label: "áo sơ mi hoặc áo khoác nhẹ đi biển",
+        filters: withOptionalCategory(maleOnlyCategory("ao-so-mi-nam"), {
+          intent: "search_products",
+          keywords: ["sơ mi"],
+          ...genderFilter,
+        }),
+      },
+      {
+        label: "áo thun hoặc polo thoáng mát",
+        filters: withOptionalCategory(maleOnlyCategory("ao-thun-nam"), {
+          intent: "search_products",
+          keywords: ["thun"],
+          ...genderFilter,
+        }),
+      },
+      {
+        label: "quần short dễ vận động",
+        filters: withOptionalCategory(maleOnlyCategory("quan-short"), {
+          intent: "search_products",
+          keywords: ["short"],
+          ...genderFilter,
+        }),
+      },
+    ];
+  }
 
   if (
     text.includes("ao so mi") ||
@@ -1553,19 +2261,21 @@ function getOutfitSearchPlans(message) {
   ) {
     return [
       {
-        label: "áo sơ mi tương tự",
+        label: "áo sơ mi phù hợp",
         filters: {
           intent: "search_products",
-          categorySlug: "ao-so-mi-nam",
+          categorySlug: styleContext.gender === "nu" ? "nu" : "ao-so-mi-nam",
           keywords: ["sơ mi"],
+          ...genderFilter,
         },
       },
       {
         label: "áo polo dễ phối cùng",
         filters: {
           intent: "search_products",
-          categorySlug: "ao-polo-nam",
+          categorySlug: styleContext.gender === "nu" ? "nu" : "ao-polo-nam",
           keywords: ["polo"],
+          ...genderFilter,
         },
       },
     ];
@@ -1574,19 +2284,21 @@ function getOutfitSearchPlans(message) {
   if (text.includes("ao polo") || text.includes("polo")) {
     return [
       {
-        label: "áo polo tương tự",
+        label: "áo polo phù hợp",
         filters: {
           intent: "search_products",
-          categorySlug: "ao-polo-nam",
+          categorySlug: styleContext.gender === "nu" ? "nu" : "ao-polo-nam",
           keywords: ["polo"],
+          ...genderFilter,
         },
       },
       {
-        label: "áo sơ mi lịch sự",
+        label: "áo sơ mi dễ phối",
         filters: {
           intent: "search_products",
-          categorySlug: "ao-so-mi-nam",
+          categorySlug: styleContext.gender === "nu" ? "nu" : "ao-so-mi-nam",
           keywords: ["sơ mi"],
+          ...genderFilter,
         },
       },
     ];
@@ -1598,16 +2310,18 @@ function getOutfitSearchPlans(message) {
         label: "áo thun dễ mặc",
         filters: {
           intent: "search_products",
-          categorySlug: "ao-thun-nam",
+          categorySlug: genderAwareCategory("ao-thun-nam"),
           keywords: ["thun"],
+          ...genderFilter,
         },
       },
       {
         label: "áo polo dễ phối",
         filters: {
           intent: "search_products",
-          categorySlug: "ao-polo-nam",
+          categorySlug: genderAwareCategory("ao-polo-nam"),
           keywords: ["polo"],
+          ...genderFilter,
         },
       },
     ];
@@ -1616,40 +2330,67 @@ function getOutfitSearchPlans(message) {
   if (text.includes("quan short") || text.includes("short")) {
     return [
       {
-        label: "quần short tương tự",
+        label: "quần short dễ vận động",
         filters: {
           intent: "search_products",
           categorySlug: "quan-short",
           keywords: ["short"],
+          ...genderFilter,
         },
       },
       {
         label: "đồ thể thao dễ phối",
         filters: {
           intent: "search_products",
-          categorySlug: "do-the-thao",
-          keywords: ["thể thao"],
+          categorySlug: "the-thao",
+          keywords: null,
+          ...genderFilter,
         },
       },
     ];
   }
 
   if (text.includes("sinh nhat") || text.includes("du tiec")) {
+    if (styleContext.gender === "nu") {
+      return [
+        {
+          label: "váy hoặc chân váy nữ đi sinh nhật",
+          filters: {
+            intent: "search_products",
+            categorySlug: "nu",
+            gender: "nu",
+            keywords: ["váy", "chân váy"],
+          },
+        },
+        {
+          label: "áo nữ thanh lịch đi sinh nhật",
+          filters: {
+            intent: "search_products",
+            categorySlug: "nu",
+            gender: "nu",
+            keywords: ["sơ mi", "polo"],
+          },
+        },
+      ];
+    }
+
     return [
       {
         label: "áo sơ mi lịch sự",
         filters: {
           intent: "search_products",
-          categorySlug: "ao-so-mi-nam",
+          categorySlug: genderAwareCategory("ao-so-mi-nam"),
           keywords: ["sơ mi"],
+          ...genderFilter,
         },
       },
       {
         label: "áo polo tối giản",
         filters: {
           intent: "search_products",
-          categorySlug: "ao-polo-nam",
+          categorySlug: genderAwareCategory("ao-polo-nam"),
           keywords: ["polo"],
+          ...genderFilter,
         },
       },
     ];
@@ -1661,16 +2402,18 @@ function getOutfitSearchPlans(message) {
         label: "áo polo dễ mặc",
         filters: {
           intent: "search_products",
-          categorySlug: "ao-polo-nam",
+          categorySlug: genderAwareCategory("ao-polo-nam"),
           keywords: ["polo"],
+          ...genderFilter,
         },
       },
       {
         label: "áo thun basic",
         filters: {
           intent: "search_products",
-          categorySlug: "ao-thun-nam",
+          categorySlug: genderAwareCategory("ao-thun-nam"),
           keywords: ["thun"],
+          ...genderFilter,
         },
       },
     ];
@@ -1679,11 +2422,20 @@ function getOutfitSearchPlans(message) {
   if (text.includes("the thao") || text.includes("gym") || text.includes("chay bo")) {
     return [
       {
-        label: "đồ thể thao",
+        label: "đồ thể thao phù hợp",
         filters: {
           intent: "search_products",
-          categorySlug: "do-the-thao",
+          categorySlug: "the-thao",
+          keywords: null,
+          ...genderFilter,
+        },
+      },
+      {
+        label: "sản phẩm thể thao dự phòng",
+        filters: {
+          intent: "search_products",
           keywords: ["thể thao"],
+          ...genderFilter,
         },
       },
     ];
@@ -1692,19 +2444,27 @@ function getOutfitSearchPlans(message) {
   if (text.includes("qua tang")) {
     return [
       {
-        label: "áo polo dễ tặng",
+        label:
+          styleContext.gender === "nu"
+            ? "trang phục nữ dễ tặng"
+            : "áo polo dễ tặng",
         filters: {
           intent: "search_products",
-          categorySlug: "ao-polo-nam",
-          keywords: ["polo"],
+          categorySlug: genderAwareCategory("ao-polo-nam"),
+          keywords: styleContext.gender === "nu" ? ["polo", "váy"] : ["polo"],
+          ...genderFilter,
         },
       },
       {
-        label: "áo sơ mi dễ mặc",
+        label:
+          styleContext.gender === "nu"
+            ? "áo hoặc váy nữ dễ mặc"
+            : "áo sơ mi dễ mặc",
         filters: {
           intent: "search_products",
-          categorySlug: "ao-so-mi-nam",
-          keywords: ["sơ mi"],
+          categorySlug: genderAwareCategory("ao-so-mi-nam"),
+          keywords: styleContext.gender === "nu" ? ["sơ mi", "váy"] : ["sơ mi"],
+          ...genderFilter,
         },
       },
     ];
@@ -1715,23 +2475,25 @@ function getOutfitSearchPlans(message) {
       label: "áo polo dễ mặc",
       filters: {
         intent: "search_products",
-        categorySlug: "ao-polo-nam",
+        categorySlug: genderAwareCategory("ao-polo-nam"),
         keywords: ["polo"],
+        ...genderFilter,
       },
     },
     {
       label: "áo sơ mi lịch sự",
       filters: {
         intent: "search_products",
-        categorySlug: "ao-so-mi-nam",
+        categorySlug: genderAwareCategory("ao-so-mi-nam"),
         keywords: ["sơ mi"],
+        ...genderFilter,
       },
     },
   ];
 }
 
-async function queryOutfitAdviceProducts(userMessage, pagination) {
-  const plans = getOutfitSearchPlans(userMessage);
+async function queryOutfitAdviceProducts(userMessage, pagination, styleContext = {}) {
+  const plans = getOutfitSearchPlans(userMessage, styleContext);
   const products = [];
   const seen = new Set();
 
@@ -1788,7 +2550,9 @@ function buildOutfitAdviceReply(userMessage, styleContext, products) {
       ? `Với thông tin bạn ${profileParts.join(", ")} và đang cần đồ cho ${occasion}, mình gợi ý bạn ưu tiên phong cách gọn gàng, dễ mặc và không quá cầu kỳ. `
       : `Với nhu cầu tìm đồ cho ${occasion}, mình gợi ý bạn ưu tiên phong cách gọn gàng, dễ mặc và không quá cầu kỳ. `;
 
-    if (occasion.includes("sinh nhật") || occasion.includes("dự tiệc")) {
+    if (occasion.includes("biển") || occasion.includes("du lịch")) {
+      reply += "Bạn nên ưu tiên trang phục thoáng, nhẹ và dễ vận động. Áo thun hoặc sơ mi ngắn tay phối với quần short sẽ hợp đi biển. Nếu muốn lên hình nổi bật hơn, có thể chọn màu sáng hoặc họa tiết nhẹ; nếu thích an toàn thì trắng, be, xanh navy hoặc đen là dễ phối. ";
+    } else if (occasion.includes("sinh nhật") || occasion.includes("dự tiệc")) {
       reply += "Bạn có thể chọn áo sơ mi form vừa nếu muốn lịch sự hơn, hoặc áo polo tối giản nếu muốn trẻ trung và thoải mái. Các màu dễ dùng là trắng, đen, xanh navy, xám hoặc be. ";
     } else if (occasion.includes("đi học")) {
       reply += "Bạn nên chọn áo polo, áo thun basic hoặc sơ mi đơn giản, ưu tiên chất liệu thoáng và màu trung tính để dễ phối nhiều ngày. ";
@@ -1800,8 +2564,7 @@ function buildOutfitAdviceReply(userMessage, styleContext, products) {
   }
 
   if (products.length) {
-    const sample = products.slice(0, 3).map((p) => p.name).join(", ");
-    reply += `Mình gợi ý một vài sản phẩm phù hợp như: ${sample}.`;
+    reply += "\n\nMình đã chọn một vài sản phẩm phù hợp bên dưới để bạn xem chi tiết.";
   } else {
     reply += "Hiện mình chưa tìm được sản phẩm thật sự phù hợp trong dữ liệu, bạn có thể nói rõ hơn về màu, ngân sách hoặc kiểu mặc bạn thích.";
   }
@@ -1842,6 +2605,42 @@ function isBroadSaleQuery(message) {
   return broadTerms.some((term) => text.includes(term));
 }
 
+function pickDiverseOutfitProducts(products, maxItems = 4) {
+  if (!Array.isArray(products) || !products.length) return [];
+
+  const picked = [];
+  const seenIds = new Set();
+  const seenReasons = new Set();
+
+  for (const product of products) {
+    const id = String(product._id || product.id || product.slug || product.name || "");
+    const reason = normalizeText(product.outfitReason || "");
+
+    if (!id || seenIds.has(id)) continue;
+
+    if (reason && seenReasons.has(reason)) continue;
+
+    picked.push(product);
+    seenIds.add(id);
+    if (reason) seenReasons.add(reason);
+
+    if (picked.length >= maxItems) return picked;
+  }
+
+  for (const product of products) {
+    const id = String(product._id || product.id || product.slug || product.name || "");
+
+    if (!id || seenIds.has(id)) continue;
+
+    picked.push(product);
+    seenIds.add(id);
+
+    if (picked.length >= maxItems) return picked;
+  }
+
+  return picked;
+}
+
 exports.chatSearch = async (req, res) => {
   try {
     const { messages, page, limit, sortBy, sortOrder, contextFilters } = req.body || {};
@@ -1855,6 +2654,11 @@ exports.chatSearch = async (req, res) => {
       return res.status(400).json({ message: "empty user message" });
     }
 
+    const conversationText = messages
+      .slice(-8)
+      .map((message) => message.content || "")
+      .join("\n");
+
     let parsed = await callGeminiForFilters(userMessage);
     if (!parsed) parsed = await fallbackParse(userMessage);
 
@@ -1863,6 +2667,11 @@ exports.chatSearch = async (req, res) => {
 
     if (!parsed.categorySlug && categorySlug) parsed.categorySlug = categorySlug;
     if (!parsed.brand && brand) parsed.brand = brand;
+
+    if (!parsed.gender) {
+      const detectedGender = extractGenderFilterFromText(userMessage);
+      if (detectedGender) parsed.gender = detectedGender;
+    }
 
     if (parsed.color) {
       const norm = normalizeColor(parsed.color.toLowerCase());
@@ -1915,10 +2724,136 @@ exports.chatSearch = async (req, res) => {
     if (sortBy) merged.sortBy = sortBy;
     if (sortOrder) merged.sortOrder = sortOrder;
 
-    await inferCategoryFromKeywords(merged, userMessage);
+    const currentMessageGender = extractGenderFilterFromText(userMessage);
+    if (currentMessageGender) {
+      merged.gender = currentMessageGender;
+    }
+
+    if (
+      ![
+        "date_question",
+        "weather_question",
+        "fashion_advice",
+        "capability_question",
+        "ai_working_explanation",
+        "privacy_memory_question",
+        "model_question",
+        "order_creation_question",
+        "greeting",
+        "policy_faq",
+      ].includes(merged.intent)
+    ) {
+      await inferCategoryFromKeywords(merged, userMessage);
+    }
+
+    if (
+      [
+        "date_question",
+        "weather_question",
+        "fashion_advice",
+        "capability_question",
+        "ai_working_explanation",
+        "privacy_memory_question",
+        "model_question",
+        "order_creation_question",
+        "greeting",
+        "policy_faq",
+      ].includes(merged.intent)
+    ) {
+      delete merged.keywords;
+      delete merged.categorySlug;
+      delete merged.brand;
+      delete merged.color;
+      delete merged.size;
+      delete merged.minPrice;
+      delete merged.maxPrice;
+      delete merged.sortBy;
+      delete merged.sortOrder;
+      delete merged.saleOnly;
+    }
 
     if (CHAT_DEBUG) {
       console.log("[CHAT_DEBUG] merged filters =>", merged);
+    }
+
+    if (merged.intent === "date_question") {
+      const now = new Date();
+
+      const dateText = new Intl.DateTimeFormat("vi-VN", {
+        weekday: "long",
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+        timeZone: "Asia/Ho_Chi_Minh",
+      }).format(now);
+
+      return res.json({
+        reply: `Hôm nay là ${dateText}. Nếu bạn đang lên lịch đi chơi hoặc du lịch, mình có thể gợi ý trang phục phù hợp theo hoàn cảnh.`,
+        filters: merged,
+        products: [],
+        metrics: { total: 0, page: 1, limit: 0 },
+      });
+    }
+
+    if (merged.intent === "weather_question") {
+      const aiReply = await generateAssistantReply({
+        userMessage,
+        conversationText,
+        intent: "weather_question",
+        products: [],
+        filters: merged,
+        metrics: { total: 0, page: 1, limit: 0 },
+      });
+
+      return res.json({
+        reply:
+          aiReply ||
+          "Hiện tại mình chưa có dữ liệu thời tiết theo thời gian thực. Bạn có thể kiểm tra thời tiết trên ứng dụng thời tiết, rồi gửi mình nhiệt độ hoặc tình trạng nắng/mưa, mình sẽ gợi ý trang phục phù hợp hơn.",
+        filters: merged,
+        products: [],
+        metrics: { total: 0, page: 1, limit: 0 },
+      });
+    }
+
+    if (merged.intent === "fashion_advice") {
+      const aiReply = await generateAssistantReply({
+        userMessage,
+        conversationText,
+        intent: "fashion_advice",
+        products: [],
+        filters: merged,
+        metrics: { total: 0, page: 1, limit: 0 },
+      });
+
+      return res.json({
+        reply:
+          aiReply ||
+          "Tuyệt vời, chuyến đi này sẽ rất hợp với những outfit nhẹ, thoáng và dễ vận động. Nếu là địa điểm biển hoặc nghỉ dưỡng, bạn có thể ưu tiên áo thun, sơ mi ngắn tay, quần short hoặc quần vải mỏng nhẹ. Nếu di chuyển ngoài trời nhiều, một chiếc áo khoác chống nắng mỏng cũng sẽ hữu ích. Bạn đi nghỉ dưỡng hay đi chơi biển là chính? Bạn thích phong cách năng động, tối giản hay nổi bật hơn một chút?",
+        filters: merged,
+        products: [],
+        metrics: { total: 0, page: 1, limit: 0 },
+      });
+    }
+
+    if (META_INTENTS.has(merged.intent)) {
+      const aiReply = await generateAssistantReply({
+        userMessage,
+        conversationText,
+        intent: merged.intent,
+        products: [],
+        filters: merged,
+        metrics: { total: 0, page: 1, limit: 0 },
+      });
+
+      return res.json({
+        reply:
+          aiReply ||
+          buildMetaIntentReply(merged.intent) ||
+          "Mình có thể hỗ trợ bạn tìm sản phẩm, tư vấn size và gợi ý phối đồ theo nhu cầu.",
+        filters: merged,
+        products: [],
+        metrics: { total: 0, page: 1, limit: 0 },
+      });
     }
 
     if (merged.intent === "greeting") {
@@ -1941,25 +2876,70 @@ exports.chatSearch = async (req, res) => {
     }
 
     if (merged.intent === "outfit_advice") {
-      const styleContext = extractStyleContext(userMessage);
+      const styleContext = getStyleContextForCurrentMessage(
+        userMessage,
+        conversationText
+      );
 
-      const outfitResult = await queryOutfitAdviceProducts(userMessage, {
-        page: Math.max(1, Number(page) || 1),
-        limit: Math.min(100, Math.max(1, Number(limit) || 6)),
+      if (CHAT_DEBUG) {
+        console.log("[CHAT_DEBUG] styleContext =>", styleContext);
+      }
+
+      const outfitResult = await queryOutfitAdviceProducts(
+        userMessage,
+        {
+          page: Math.max(1, Number(page) || 1),
+          limit: Math.min(100, Math.max(1, Number(limit) || 6)),
+        },
+        styleContext
+      );
+
+      const outfitProducts = pickDiverseOutfitProducts(outfitResult.products, 4);
+      if (CHAT_DEBUG) {
+        console.log(
+          "[CHAT_DEBUG] outfit products =>",
+          outfitProducts.map((p) => ({
+            name: p.name,
+            gender: p.gender,
+            reason: p.outfitReason,
+          }))
+        );
+      }
+
+      const outfitFilters = {
+        ...merged,
+        intent: "outfit_advice",
+        styleContext,
+      };
+
+      const aiReply = await generateAssistantReply({
+        userMessage,
+        conversationText,
+        intent: "outfit_advice",
+        products: outfitProducts,
+        filters: outfitFilters,
+        metrics: {
+          total: outfitProducts.length,
+          page: outfitResult.page,
+          limit: outfitProducts.length,
+        },
+        styleContext,
       });
 
+      if (CHAT_DEBUG) {
+        console.log("[CHAT_DEBUG] outfit aiReply:", aiReply);
+      }
+
       return res.json({
-        reply: buildOutfitAdviceReply(userMessage, styleContext, outfitResult.products),
-        filters: {
-          ...merged,
-          intent: "outfit_advice",
-          styleContext,
-        },
-        products: outfitResult.products,
+        reply:
+          aiReply ||
+          buildOutfitAdviceReply(userMessage, styleContext, outfitProducts),
+        filters: outfitFilters,
+        products: outfitProducts,
         metrics: {
-          total: outfitResult.total,
+          total: outfitProducts.length,
           page: outfitResult.page,
-          limit: outfitResult.limit,
+          limit: outfitProducts.length,
         },
       });
     }
@@ -1968,8 +2948,20 @@ exports.chatSearch = async (req, res) => {
       const body = extractBodyInfo(userMessage);
 
       if (!body.heightCm || !body.weightKg) {
+        const fallbackReply = buildSizeAdviceReply(body, null, 0);
+
+        const aiReply = await generateAssistantReply({
+          userMessage,
+          conversationText,
+          intent: "size_advice",
+          products: [],
+          filters: merged,
+          metrics: { total: 0, page: 1, limit: 0 },
+          sizeSuggestion: null,
+        });
+
         return res.json({
-          reply: buildSizeAdviceReply(body, null, 0),
+          reply: aiReply || fallbackReply,
           filters: merged,
           products: [],
           metrics: { total: 0, page: 1, limit: 0 },
@@ -1977,6 +2969,7 @@ exports.chatSearch = async (req, res) => {
       }
 
       const suggestedSize = recommendSizeFromBody(body);
+
       const sizeFilters = {
         ...merged,
         size: suggestedSize,
@@ -1988,12 +2981,35 @@ exports.chatSearch = async (req, res) => {
         limit: Math.min(100, Math.max(1, Number(limit) || 6)),
       });
 
-      return res.json({
-        reply: buildSizeAdviceReply(body, suggestedSize, result.total),
-        filters: {
-          ...sizeFilters,
-          sizeSuggestion: suggestedSize,
+      const responseFilters = {
+        ...sizeFilters,
+        sizeSuggestion: suggestedSize,
+      };
+
+      const fallbackReply = buildSizeAdviceReply(body, suggestedSize, result.total);
+
+      const aiReply = await generateAssistantReply({
+        userMessage,
+        conversationText,
+        intent: "size_advice",
+        products: result.products,
+        filters: responseFilters,
+        metrics: {
+          total: result.total,
+          page: result.page,
+          limit: result.limit,
         },
+        sizeSuggestion: {
+          heightCm: body.heightCm,
+          weightKg: body.weightKg,
+          gender: body.gender,
+          suggestedSize,
+        },
+      });
+
+      return res.json({
+        reply: aiReply || fallbackReply,
+        filters: responseFilters,
         products: result.products,
         metrics: {
           total: result.total,
@@ -2002,7 +3018,6 @@ exports.chatSearch = async (req, res) => {
         },
       });
     }
-
     if (merged.intent === "sale_products") {
       const saleKeywords = filterKeywordsForSale(merged.keywords);
 
@@ -2011,6 +3026,7 @@ exports.chatSearch = async (req, res) => {
         merged.brand ||
         merged.color ||
         merged.size ||
+        merged.gender ||
         (saleKeywords && saleKeywords.length)
       );
 
@@ -2036,7 +3052,6 @@ exports.chatSearch = async (req, res) => {
         limit: Math.min(100, Math.max(1, Number(limit) || 12)),
       });
 
-      // Nếu vẫn không có kết quả do keyword/filter bị hiểu sai, thử lại bằng sale rộng.
       if (!result.total) {
         const fallbackSaleFilters = {
           intent: "sale_products",
@@ -2044,6 +3059,7 @@ exports.chatSearch = async (req, res) => {
           sortBy: "discount",
           sortOrder: "desc",
           keywords: null,
+          gender: saleFilters.gender || merged.gender || null,
         };
 
         result = await queryProducts(fallbackSaleFilters, {
@@ -2051,12 +3067,25 @@ exports.chatSearch = async (req, res) => {
           limit: Math.min(100, Math.max(1, Number(limit) || 12)),
         });
 
-        const reply = result.total
+        const fallbackReply = result.total
           ? buildSaleReply(result.total, result.products)
           : buildSaleReply(0, []);
 
+        const aiReply = await generateAssistantReply({
+          userMessage,
+          conversationText,
+          intent: "sale_products",
+          products: result.products,
+          filters: fallbackSaleFilters,
+          metrics: {
+            total: result.total,
+            page: result.page,
+            limit: result.limit,
+          },
+        });
+
         return res.json({
-          reply,
+          reply: aiReply || fallbackReply,
           filters: fallbackSaleFilters,
           products: result.products,
           metrics: {
@@ -2067,12 +3096,25 @@ exports.chatSearch = async (req, res) => {
         });
       }
 
-      const reply = isBestDiscountQuestion(userMessage)
+      const fallbackReply = isBestDiscountQuestion(userMessage)
         ? buildBestDiscountReply(result.products)
         : buildSaleReply(result.total, result.products);
 
+      const aiReply = await generateAssistantReply({
+        userMessage,
+        conversationText,
+        intent: "sale_products",
+        products: result.products,
+        filters: saleFilters,
+        metrics: {
+          total: result.total,
+          page: result.page,
+          limit: result.limit,
+        },
+      });
+
       return res.json({
-        reply,
+        reply: aiReply || fallbackReply,
         filters: saleFilters,
         products: result.products,
         metrics: {
@@ -2105,8 +3147,21 @@ exports.chatSearch = async (req, res) => {
       }
     }
 
+    const aiReply = await generateAssistantReply({
+      userMessage,
+      conversationText,
+      intent: responseFilters.intent || "search_products",
+      products: result.products,
+      filters: responseFilters,
+      metrics: {
+        total: result.total,
+        page: result.page,
+        limit: result.limit,
+      },
+    });
+
     return res.json({
-      reply,
+      reply: aiReply || reply,
       filters: responseFilters,
       products: result.products,
       metrics: {
