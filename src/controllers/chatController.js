@@ -70,7 +70,9 @@ const STOPWORDS = new Set([
   "dưới", "duoi", "trên", "tren", "từ", "tu", "khoảng", "khoang",
   "rẻ", "re", "hơn", "hon", "ngân", "sách", "sach",
   "của", "cua", "với", "voi", "để", "de", "và", "va", "là", "la",
-  "không", "khong", "đang", "dang", "nào", "nao"
+  "không", "khong", "đang", "dang", "nào", "nao",
+  "món", "mon", "phù", "phu", "hợp", "hop", "phù hợp", "phu hop",
+  "vậy", "vay"
 ]);
 
 const SALE_TERMS = new Set([
@@ -185,6 +187,14 @@ const OUTFIT_ADVICE_TERMS = [
   "set đồ",
   "goi y set",
   "gợi ý set",
+  "tang qua",
+  "tặng quà",
+  "tang vo",
+  "tặng vợ",
+  "qua cho vo",
+  "quà cho vợ",
+  "vo",
+  "vợ",
 ];
 
 const CATEGORY_ALIASES = [
@@ -214,7 +224,7 @@ const CATEGORY_ALIASES = [
   },
   {
     slugCandidates: ["phu-kien", "phu-kien-nam"],
-    aliases: ["phu kien", "that lung", "vo", "tat", "mu", "non"],
+    aliases: ["phu kien", "that lung", "tat", "mu", "non"],
   },
 ];
 
@@ -420,9 +430,10 @@ function hasExplicitSizeCue(message) {
 }
 
 function hasSpecificCategoryCue(message) {
-  const text = normalizeText(message || "");
+  const raw = String(message || "").toLowerCase();
+  const text = normalizePhrase(message || "");
 
-  return includesAnyNormalized(text, [
+  const phraseTerms = [
     "ao polo",
     "polo",
     "ao so mi",
@@ -431,14 +442,64 @@ function hasSpecificCategoryCue(message) {
     "thun",
     "ao khoac",
     "quan",
-    "vay",
     "chan vay",
     "do the thao",
     "short",
     "jean",
     "kaki",
     "san pham",
-  ]);
+  ];
+
+  if (phraseTerms.some((term) => hasPhrase(text, term))) {
+    return true;
+  }
+
+  // Chặn lỗi "vậy" bị normalize thành "vay".
+  // Chỉ nhận là váy nếu user thật sự gõ "váy" hoặc "vay" không dấu.
+  const rawTokens = raw
+    .split(/[^\p{L}\p{N}]+/u)
+    .map((token) => token.trim())
+    .filter(Boolean);
+
+  if (rawTokens.includes("váy")) {
+    return true;
+  }
+
+  const noToneVayLooksLikeDress =
+    rawTokens.includes("vay") &&
+    !(
+      rawTokens.includes("co") &&
+      rawTokens.includes("mon") &&
+      rawTokens.includes("phu") &&
+      rawTokens.includes("hop")
+    );
+
+  if (noToneVayLooksLikeDress) {
+    return true;
+  }
+
+  return false;
+}
+
+function hasBudgetMaxCue(message) {
+  const raw = String(message || "").toLowerCase();
+
+  return (
+    hasPhrase(raw, "toi co") ||
+    hasPhrase(raw, "mình có") ||
+    hasPhrase(raw, "minh co") ||
+    hasPhrase(raw, "ngan sach") ||
+    hasPhrase(raw, "ngân sách") ||
+    hasPhrase(raw, "budget") ||
+    hasPhrase(raw, "toi da") ||
+    hasPhrase(raw, "tối đa") ||
+    hasPhrase(raw, "khong qua") ||
+    hasPhrase(raw, "không quá") ||
+    hasPhrase(raw, "duoi") ||
+    hasPhrase(raw, "dưới") ||
+    hasPhrase(raw, "so tien") ||
+    hasPhrase(raw, "số tiền")
+  );
 }
 
 function extractPrices(textLower) {
@@ -446,8 +507,10 @@ function extractPrices(textLower) {
     return { minPrice: null, maxPrice: null };
   }
 
+  const raw = String(textLower || "").toLowerCase();
+
   const unitFactor = (n, u) => {
-    let num = Number(n.replace(/[.,]/g, ""));
+    let num = Number(String(n).replace(/[.,]/g, ""));
     if (isNaN(num)) return null;
 
     if (!u) {
@@ -455,10 +518,12 @@ function extractPrices(textLower) {
       return num;
     }
 
-    u = u.trim();
+    u = u.trim().toLowerCase();
+
     if (["k", "ngàn", "nghìn", "k."].includes(u)) return num * 1000;
     if (["tr", "triệu"].includes(u)) return num * 1_000_000;
     if (["trăm"].includes(u)) return num * 100;
+
     return num;
   };
 
@@ -466,14 +531,16 @@ function extractPrices(textLower) {
   let maxPrice = null;
 
   const rangeR =
-    /(\d+(?:[.,]\d+)?)(\s?(k|ngàn|nghìn|tr|triệu|trăm)?)\s*(?:-|đến|to|>|<|>=|<=|~)\s*(\d+(?:[.,]\d+)?)(\s?(k|ngàn|nghìn|tr|triệu|trăm)?)/;
-  const singleR =
-    /(dưới|trên|từ|>=|<=|>|<|~)?\s*(\d+(?:[.,]\d+)?)(\s?(k|ngàn|nghìn|tr|triệu|trăm)?)/;
+    /(\d+(?:[.,]\d+)?)(\s?(k|ngàn|nghìn|tr|triệu|trăm)?)\s*(?:-|đến|to|>|<|>=|<=|~)\s*(\d+(?:[.,]\d+)?)(\s?(k|ngàn|nghìn|tr|triệu|trăm)?)/i;
 
-  const rangeM = textLower.match(rangeR);
+  const singleR =
+    /(dưới|duoi|trên|tren|từ|tu|>=|<=|>|<|~)?\s*(\d+(?:[.,]\d+)?)(\s?(k|ngàn|nghìn|tr|triệu|trăm)?)/i;
+
+  const rangeM = raw.match(rangeR);
   if (rangeM) {
     const v1 = unitFactor(rangeM[1], rangeM[3]);
     const v2 = unitFactor(rangeM[4], rangeM[6]);
+
     if (v1 && v2) {
       minPrice = Math.min(v1, v2);
       maxPrice = Math.max(v1, v2);
@@ -481,18 +548,25 @@ function extractPrices(textLower) {
     }
   }
 
-  const sM = textLower.match(singleR);
+  const sM = raw.match(singleR);
   if (sM) {
-    const dir = sM[1];
+    const dir = normalizeText(sM[1] || "");
     const val = unitFactor(sM[2], sM[4]);
+    const budgetMaxCue = hasBudgetMaxCue(raw);
+
     if (val) {
-      if (!dir || dir === "~") {
+      if (["duoi", "<", "<="].includes(dir)) {
+        maxPrice = val;
+      } else if (["tren", "tu", ">", ">="].includes(dir)) {
+        minPrice = val;
+      } else if (budgetMaxCue) {
+        maxPrice = val;
+      } else if (dir === "~") {
+        minPrice = Math.round(val * 0.8);
+        maxPrice = Math.round(val * 1.2);
+      } else {
         minPrice = Math.round(val);
         maxPrice = Math.round(val * 1.3);
-      } else if (["dưới", "<", "<="].includes(dir)) {
-        maxPrice = val;
-      } else if (["trên", "từ", ">", ">="].includes(dir)) {
-        minPrice = val;
       }
     }
   }
@@ -524,8 +598,36 @@ function extractBodyInfo(message) {
     weightKg = Number(weight[1]);
   }
 
-  if (/\b(nu|nữ|con gai|phu nu)\b/.test(text)) gender = "female";
-  else if (/\b(nam|con trai|dan ong)\b/.test(text)) gender = "male";
+  const relationshipGender = detectRelationshipGender(message);
+
+  if (relationshipGender === "nu") {
+    gender = "female";
+  } else if (relationshipGender === "nam") {
+    gender = "male";
+  } else {
+    const raw = String(message || "").toLowerCase();
+
+    if (
+      /\b(nữ|nu|female)\b/i.test(raw) ||
+      raw.includes("con gái") ||
+      raw.includes("con gai") ||
+      raw.includes("phụ nữ") ||
+      raw.includes("phu nu") ||
+      raw.includes("bạn gái") ||
+      raw.includes("ban gai")
+    ) {
+      gender = "female";
+    } else if (
+      /\b(nam|male)\b/i.test(raw) ||
+      raw.includes("con trai") ||
+      raw.includes("đàn ông") ||
+      raw.includes("dan ong") ||
+      raw.includes("bạn trai") ||
+      raw.includes("ban trai")
+    ) {
+      gender = "male";
+    }
+  }
 
   return { heightCm, weightKg, gender };
 }
@@ -543,10 +645,22 @@ function recommendSizeFromBody({ heightCm, weightKg, gender }) {
   if (!heightCm || !weightKg) return null;
 
   if (gender === "female") {
-    if (heightCm <= 155 && weightKg <= 45) return "S";
-    if (heightCm <= 162 && weightKg <= 52) return "M";
-    if (heightCm <= 168 && weightKg <= 60) return "L";
-    if (heightCm <= 173 && weightKg <= 68) return "XL";
+    if (weightKg <= 45) {
+      if (heightCm <= 158) return "S";
+      return "M";
+    }
+
+    if (weightKg <= 52) {
+      return "M";
+    }
+
+    if (weightKg <= 60) {
+      if (heightCm <= 165) return "M";
+      return "L";
+    }
+
+    if (weightKg <= 68) return "XL";
+
     return "2XL";
   }
 
@@ -555,6 +669,7 @@ function recommendSizeFromBody({ heightCm, weightKg, gender }) {
   if (heightCm <= 176 && weightKg <= 78) return "L";
   if (heightCm <= 182 && weightKg <= 88) return "XL";
   if (heightCm <= 188 && weightKg <= 98) return "2XL";
+
   return "3XL";
 }
 
@@ -578,13 +693,20 @@ function buildSizeAdviceReply(body, size, totalProducts) {
   return tone;
 }
 
-function buildSaleReply(total, sampleProducts) {
+function buildSaleReply(total, sampleProducts = [], filters = {}) {
   if (!total) {
-    return "Hiện mình chưa thấy sản phẩm sale phù hợp. Bạn thử đổi danh mục hoặc hỏi cụ thể hơn nhé.";
+    if (filters.maxPrice) {
+      return `Hiện mình chưa thấy sản phẩm sale nào phù hợp trong ngân sách dưới ${formatVnd(filters.maxPrice)}. Bạn có thể tăng ngân sách một chút hoặc bỏ điều kiện sale để mình tìm thêm lựa chọn khác.`;
+    }
+
+    return "Hiện mình chưa thấy sản phẩm sale phù hợp. Bạn thử đổi danh mục, khoảng giá hoặc hỏi cụ thể hơn nhé.";
   }
 
-  const sample = sampleProducts.slice(0, 5).map((p) => p.name).join(", ");
-  return `Mình tìm thấy ${total} sản phẩm đang sale. Ví dụ: ${sample}. Muốn lọc thêm theo giá, màu hoặc size không?`;
+  if (filters.maxPrice) {
+    return `Mình tìm được ${total} sản phẩm đang sale trong ngân sách dưới ${formatVnd(filters.maxPrice)}. Bạn có thể xem các lựa chọn bên dưới, mỗi sản phẩm đều có lý do gợi ý để dễ cân nhắc hơn.`;
+  }
+
+  return `Mình tìm được ${total} sản phẩm đang sale. Bạn có thể xem các lựa chọn bên dưới, mỗi sản phẩm đều có lý do gợi ý để dễ cân nhắc hơn.`;
 }
 
 function isBestDiscountQuestion(message) {
@@ -1163,6 +1285,12 @@ function wantsConcreteProductSuggestion(message) {
     "tren",
     "ngan sach",
     "sale",
+    "tang qua",
+    "qua tang",
+    "tang vo",
+    "tang ban gai",
+    "tang me",
+    "qua cho vo",
   ]);
 }
 
@@ -1177,6 +1305,50 @@ function isGeneralWearAdviceQuestion(message) {
     "phoi do sao",
     "phoi do nhu the nao",
   ]);
+}
+
+function isReasonFollowUpQuestion(message) {
+  const text = normalizeText(message || "").trim();
+
+  return [
+    "tai sao",
+    "tai sao vay",
+    "vi sao",
+    "sao vay",
+    "ly do",
+    "ly do gi",
+    "tai sao lai chon",
+    "vi sao chon",
+  ].some((term) => text === term || text.includes(term));
+}
+
+function isStandaloneBudgetQuestion(message) {
+  const text = normalizeText(message || "");
+
+  const hasBudget =
+    hasPriceCue(message) ||
+    hasPhrase(text, "toi co") ||
+    hasPhrase(text, "minh co") ||
+    hasPhrase(text, "ngan sach") ||
+    hasPhrase(text, "so tien");
+
+  const hasProductRequest =
+    hasPhrase(text, "mua duoc do gi") ||
+    hasPhrase(text, "mua duoc gi") ||
+    hasPhrase(text, "co the mua") ||
+    hasPhrase(text, "san pham nao") ||
+    hasPhrase(text, "do gi") ||
+    hasPhrase(text, "mon nao");
+
+  return hasBudget && hasProductRequest;
+}
+
+function isExplicitSaleQuestion(message) {
+  const text = normalizeText(message || "");
+
+  return [...SALE_TERMS].some((term) =>
+    text.includes(normalizeText(term))
+  );
 }
 
 function inferIntentHeuristic(userMessage, parsedIntent = null) {
@@ -1206,6 +1378,10 @@ function inferIntentHeuristic(userMessage, parsedIntent = null) {
 
   if (isDateQuestion || parsedIntent === "date_question") {
     return "date_question";
+  }
+
+  if (isReasonFollowUpQuestion(userMessage)) {
+    return "recommendation_reason_question";
   }
 
   const isWeatherQuestion =
@@ -1240,6 +1416,13 @@ function inferIntentHeuristic(userMessage, parsedIntent = null) {
     );
 
   if (
+    parsedIntent === "fashion_advice" &&
+    wantsConcreteProductSuggestion(userMessage)
+  ) {
+    return "outfit_advice";
+  }
+
+  if (
     isTravelFashionAdvice ||
     isTravelContextMessage(userMessage) ||
     parsedIntent === "fashion_advice"
@@ -1252,10 +1435,6 @@ function inferIntentHeuristic(userMessage, parsedIntent = null) {
     !wantsConcreteProductSuggestion(userMessage)
   ) {
     return "fashion_advice";
-  }
-
-  if (parsedIntent === "outfit_advice") {
-    return "outfit_advice";
   }
 
   if (isGreetingOnly(userMessage)) {
@@ -1276,6 +1455,33 @@ function inferIntentHeuristic(userMessage, parsedIntent = null) {
     text.includes("size nao") ||
     text.includes("size nào");
 
+  const bodyInfoForOutfit =
+    hasHeight &&
+    hasWeight &&
+    !askSize &&
+    includesAnyNormalized(text, [
+      "mua do",
+      "can mua do",
+      "can do",
+      "do mac",
+      "mac de di",
+      "di an sinh nhat",
+      "sinh nhat",
+      "di tiec",
+      "du tiec",
+      "di lam",
+      "di choi",
+      "chon do",
+      "chon giup",
+      "vai mon",
+      "co mon nao",
+      "phu hop",
+    ]);
+
+  if (bodyInfoForOutfit) {
+    return "outfit_advice";
+  }
+
   if (askSize || (hasHeight && hasWeight)) {
     return "size_advice";
   }
@@ -1292,6 +1498,14 @@ function inferIntentHeuristic(userMessage, parsedIntent = null) {
     return "policy_faq";
   }
 
+  if ([...SALE_TERMS].some((term) => text.includes(normalizeText(term)))) {
+    return "sale_products";
+  }
+
+  if (parsedIntent === "outfit_advice") {
+    return "outfit_advice";
+  }
+
   if (isOutfitAdviceQuestion(userMessage)) {
     if (
       isGeneralWearAdviceQuestion(userMessage) &&
@@ -1303,9 +1517,7 @@ function inferIntentHeuristic(userMessage, parsedIntent = null) {
     return "outfit_advice";
   }
 
-  if ([...SALE_TERMS].some((term) => text.includes(normalizeText(term)))) {
-    return "sale_products";
-  }
+
 
   return "search_products";
 }
@@ -1537,6 +1749,11 @@ Nếu người dùng nói "chọn giúp", "vài món", "phối set", "phong các
 Nếu người dùng hỏi tư vấn mặc gì theo địa điểm, mùa, thời tiết hoặc du lịch nhưng chưa yêu cầu sản phẩm cụ thể, đặt intent là "fashion_advice".
 Nếu người dùng nhắc nam, con trai, đàn ông, bạn trai, đặt gender là "nam".
 Nếu người dùng nhắc nữ, con gái, phụ nữ, bạn gái, đặt gender là "nu".
+Nếu người dùng nói "vợ", "vợ tôi", "bạn gái", "mẹ", "chị", "em gái", đặt gender là "nu".
+Nếu người dùng nói "chồng", "bạn trai", "bố", "ba", "anh trai", "em trai", đặt gender là "nam".
+Không được hiểu chữ "năm" trong "năm nay", "40 năm", "50 năm" là giới tính nam.
+Nếu người dùng nói "năm nay 40 tuổi", đây là tuổi, không phải gender nam.
+Nếu người dùng hỏi quà tặng cho vợ/bạn gái/mẹ, ưu tiên sản phẩm nữ như váy, chân váy, áo nữ, áo khoác nữ nếu database có.
 Nếu người dùng nhắc unisex, đặt gender là "unisex".
 Nếu người dùng hỏi bạn làm được gì, hỗ trợ gì, chức năng gì, đặt intent là "capability_question".
 Nếu người dùng hỏi bạn hoạt động như thế nào, hiểu câu hỏi ra sao, xử lý dữ liệu thế nào, đặt intent là "ai_working_explanation".
@@ -1567,22 +1784,99 @@ Không thêm giải thích ngoài JSON.`;
   }
 }
 
+function detectRelationshipGender(message) {
+  const raw = String(message || "").toLowerCase();
+
+  const femaleRaw =
+    raw.includes("vợ") ||
+    raw.includes("bạn gái") ||
+    raw.includes("mẹ") ||
+    raw.includes("má") ||
+    raw.includes("chị gái") ||
+    raw.includes("em gái");
+
+  const femaleNoTone = [
+    "vo toi",
+    "vo minh",
+    "vo cua toi",
+    "vo nam nay",
+    "tang vo",
+    "tang qua cho vo",
+    "qua cho vo",
+    "ban gai",
+    "me toi",
+    "me minh",
+    "chi gai",
+    "em gai",
+  ].some((phrase) => hasPhrase(message, phrase));
+
+  if (femaleRaw || femaleNoTone) {
+    return "nu";
+  }
+
+  const maleRaw =
+    raw.includes("chồng") ||
+    raw.includes("bạn trai") ||
+    raw.includes("bố") ||
+    raw.includes("ba") ||
+    raw.includes("cha") ||
+    raw.includes("anh trai") ||
+    raw.includes("em trai");
+
+  const maleNoTone = [
+    "chong toi",
+    "chong minh",
+    "chong cua toi",
+    "tang chong",
+    "tang qua cho chong",
+    "qua cho chong",
+    "ban trai",
+    "bo toi",
+    "ba toi",
+    "cha toi",
+    "anh trai",
+    "em trai",
+  ].some((phrase) => hasPhrase(message, phrase));
+
+  if (maleRaw || maleNoTone) {
+    return "nam";
+  }
+
+  return null;
+}
+
 function extractGenderFilterFromText(message) {
-  const text = normalizeText(message || "");
+  const raw = String(message || "").toLowerCase();
+
+  const relationshipGender = detectRelationshipGender(message);
+  if (relationshipGender) {
+    return relationshipGender;
+  }
 
   if (
-    /\b(nam|con trai|dan ong|ban trai|male)\b/.test(text)
+    /\b(nam|male)\b/i.test(raw) ||
+    raw.includes("con trai") ||
+    raw.includes("đàn ông") ||
+    raw.includes("dan ong") ||
+    raw.includes("bạn trai") ||
+    raw.includes("ban trai")
   ) {
     return "nam";
   }
 
   if (
-    /\b(nu|nữ|con gai|phu nu|ban gai|female)\b/.test(text)
+    /\b(nữ|nu|female)\b/i.test(raw) ||
+    raw.includes("con gái") ||
+    raw.includes("con gai") ||
+    raw.includes("phụ nữ") ||
+    raw.includes("phu nu") ||
+    raw.includes("bạn gái") ||
+    raw.includes("ban gai")
   ) {
     return "nu";
   }
 
-  if (text.includes("unisex")) {
+  if (raw.includes("unisex")) {
     return "unisex";
   }
 
@@ -2151,14 +2445,31 @@ function hasOnlyRefinement(parsed) {
 }
 
 function shouldKeepPreviousFilters(userMessage, parsed, previousFilters) {
+  if (isStandaloneBudgetQuestion(userMessage)) {
+    return false;
+  }
+
+  if (isExplicitSaleQuestion(userMessage)) {
+    return false;
+  }
+
+  if (parsed?.intent === "sale_products" || parsed?.intent === "size_advice") {
+    return false;
+  }
+
   if (!previousFilters) return false;
 
   const text = normalizeText(userMessage || "");
 
-  // Nếu câu mới đã có anchor sản phẩm rõ ràng thì coi là truy vấn mới.
+  // Các câu follow-up kiểu "vậy có món nào phù hợp" phải giữ context cũ,
+  // kể cả khi Gemini parse ra keyword rác hoặc category "váy".
+  if (isStyleFollowUpMessage(userMessage)) {
+    return true;
+  }
+
+  // Nếu câu mới có anchor sản phẩm rõ ràng thì coi là truy vấn mới.
   if (hasCurrentProductAnchor(parsed)) return false;
 
-  // Một số câu nhìn như truy vấn mới, không nên giữ filter cũ.
   const newQueryTerms = [
     "ao polo",
     "polo",
@@ -2184,7 +2495,6 @@ function shouldKeepPreviousFilters(userMessage, parsed, previousFilters) {
     return false;
   }
 
-  // Câu hỏi sale tổng quát cũng nên reset, không nên kẹt context cũ.
   const hasSaleTerm = [...SALE_TERMS].some((term) =>
     text.includes(normalizeText(term))
   );
@@ -2226,6 +2536,16 @@ function shouldKeepPreviousFilters(userMessage, parsed, previousFilters) {
     "tam",
     "khoang",
     "gia",
+    "vay",
+    "mon",
+    "cac mon",
+    "do nao",
+    "mon nao",
+    "phu hop",
+    "cho minh",
+    "chon tiep",
+    "co mon nao",
+    "co do nao",
   ];
 
   if (hasOnlyRefinement(parsed)) return true;
@@ -2321,8 +2641,34 @@ function extractStyleContext(message) {
   const ageMatch = text.match(/\b(1[0-9]|[2-7][0-9]|80)\s*tuoi\b/);
   if (ageMatch) age = Number(ageMatch[1]);
 
-  if (/\b(nam|con trai|dan ong|ban trai)\b/.test(text)) gender = "nam";
-  else if (/\b(nu|nữ|con gai|phu nu|ban gai)\b/.test(text)) gender = "nu";
+  const relationshipGender = detectRelationshipGender(message);
+
+  if (relationshipGender) {
+    gender = relationshipGender;
+  } else {
+    const raw = String(message || "").toLowerCase();
+
+    if (
+      /\b(nữ|nu|female)\b/i.test(raw) ||
+      raw.includes("con gái") ||
+      raw.includes("con gai") ||
+      raw.includes("phụ nữ") ||
+      raw.includes("phu nu") ||
+      raw.includes("bạn gái") ||
+      raw.includes("ban gai")
+    ) {
+      gender = "nu";
+    } else if (
+      /\b(nam|male)\b/i.test(raw) ||
+      raw.includes("con trai") ||
+      raw.includes("đàn ông") ||
+      raw.includes("dan ong") ||
+      raw.includes("bạn trai") ||
+      raw.includes("ban trai")
+    ) {
+      gender = "nam";
+    }
+  }
 
   if (text.includes("sinh vien")) customerType = "sinh viên";
   else if (text.includes("hoc sinh")) customerType = "học sinh";
@@ -2384,12 +2730,20 @@ function isStyleFollowUpMessage(message) {
     "chon vai mon",
     "mau nao phu hop",
     "mon nao phu hop",
+    "vay co mon nao phu hop",
+    "vậy có món nào phù hợp",
+    "co mon nao phu hop",
+    "có món nào phù hợp",
+    "co do nao phu hop",
+    "có đồ nào phù hợp",
+    "mon nao hop",
+    "món nào hợp",
     "theo huong do",
     "nhu tren",
     "goi y tiep",
     "phoi thanh set",
     "set do",
-  ].some((term) => text.includes(term));
+  ].some((term) => text.includes(normalizeText(term)));
 }
 
 function getStyleContextForCurrentMessage(userMessage, recentUserMessages = []) {
@@ -2867,6 +3221,29 @@ function buildOutfitAdviceReply(userMessage, styleContext = {}, products = []) {
 
   const hasProducts = Array.isArray(products) && products.length > 0;
 
+  const text = normalizeText(userMessage || "");
+
+  if (
+    hasProducts &&
+    (
+      text.includes("tang qua") ||
+      text.includes("qua tang") ||
+      text.includes("tang vo") ||
+      text.includes("qua cho vo")
+    )
+  ) {
+    return "Với quà tặng cho vợ, mình ưu tiên các món dễ mặc, màu sắc nhẹ nhàng và ít kén dáng. Các sản phẩm bên dưới phù hợp để tặng vì có thể dùng trong nhiều dịp, dễ phối và có lý do gợi ý riêng để bạn cân nhắc.";
+  }
+
+  if (
+    hasProducts &&
+    styleContext.gender === "nu" &&
+    styleContext.age &&
+    styleContext.occasion === "dự tiệc sinh nhật"
+  ) {
+    return `Với nhu cầu chọn đồ đi sinh nhật cho nữ khoảng ${styleContext.age} tuổi, mình ưu tiên các món có màu nhẹ, dễ mặc và vẫn đủ chỉn chu. Các sản phẩm bên dưới phù hợp để đi ăn hoặc gặp mặt bạn bè, dễ phối và có lý do gợi ý riêng để bạn cân nhắc.`;
+  }
+
   if (
     styleContext.gender === "nu" &&
     styleContext.age &&
@@ -2990,10 +3367,16 @@ exports.chatSearch = async (req, res) => {
     if (!parsed) parsed = await fallbackParse(userMessage);
 
     const lower = userMessage.toLowerCase();
+    const shouldInferCategoryFromMessage = hasSpecificCategoryCue(userMessage);
     const { categorySlug, brand } = await semanticCategoryBrand(lower);
 
-    if (!parsed.categorySlug && categorySlug) parsed.categorySlug = categorySlug;
-    if (!parsed.brand && brand) parsed.brand = brand;
+    if (shouldInferCategoryFromMessage && !parsed.categorySlug && categorySlug) {
+      parsed.categorySlug = categorySlug;
+    }
+
+    if (!parsed.brand && brand) {
+      parsed.brand = brand;
+    }
 
     if (!parsed.gender) {
       const detectedGender = extractGenderFilterFromText(userMessage);
@@ -3056,6 +3439,83 @@ exports.chatSearch = async (req, res) => {
       merged.gender = currentMessageGender;
     }
 
+    if (isStandaloneBudgetQuestion(userMessage)) {
+      delete merged.gender;
+      delete merged.size;
+      delete merged.categorySlug;
+      delete merged.sizeSuggestion;
+      merged.keywords = null;
+    }
+
+    if (isExplicitSaleQuestion(userMessage)) {
+      merged.intent = "sale_products";
+    }
+
+    if (
+      isStyleFollowUpMessage(userMessage) &&
+      !hasSpecificCategoryCue(userMessage) &&
+      !isStandaloneBudgetQuestion(userMessage) &&
+      !isExplicitSaleQuestion(userMessage)
+    ) {
+      merged.intent = "outfit_advice";
+      delete merged.categorySlug;
+
+      if (!merged.color && contextFilters?.color) {
+        merged.color = contextFilters.color;
+      }
+
+      if (!merged.gender && contextFilters?.gender) {
+        merged.gender = contextFilters.gender;
+      }
+
+      if (!hasExplicitSizeCue(userMessage)) {
+        delete merged.size;
+        delete merged.sizeSuggestion;
+      }
+
+      merged.keywords = null;
+    }
+
+    if (!merged.gender && !isStandaloneBudgetQuestion(userMessage)) {
+      const styleContextForGender = getStyleContextForCurrentMessage(
+        userMessage,
+        recentUserMessages
+      );
+
+      if (
+        styleContextForGender.gender &&
+        (
+          isStyleFollowUpMessage(userMessage) ||
+          shouldKeepPreviousFilters(userMessage, parsed, contextFilters)
+        )
+      ) {
+        merged.gender = styleContextForGender.gender;
+      }
+    }
+
+    if (
+      ["nam", "nu", "unisex"].includes(merged.categorySlug) &&
+      !hasSpecificCategoryCue(userMessage)
+    ) {
+      delete merged.categorySlug;
+    }
+
+    if (
+      merged.gender === "nu" &&
+      typeof merged.categorySlug === "string" &&
+      /(^|-)nam($|-)/.test(merged.categorySlug)
+    ) {
+      delete merged.categorySlug;
+    }
+
+    if (
+      merged.gender === "nam" &&
+      typeof merged.categorySlug === "string" &&
+      /(^|-)nu($|-)/.test(merged.categorySlug)
+    ) {
+      delete merged.categorySlug;
+    }
+
     const currentMessageColor = normalizeColor(lower);
     const currentMessageHasColorCue =
       currentMessageColor ||
@@ -3067,6 +3527,7 @@ exports.chatSearch = async (req, res) => {
     }
 
     if (
+      shouldInferCategoryFromMessage &&
       ![
         "date_question",
         "weather_question",
@@ -3082,7 +3543,6 @@ exports.chatSearch = async (req, res) => {
     ) {
       await inferCategoryFromKeywords(merged, userMessage);
     }
-
     if (
       [
         "date_question",
@@ -3348,6 +3808,37 @@ exports.chatSearch = async (req, res) => {
         keywords: filterKeywordsForSizeAdvice(merged.keywords),
       };
 
+      if (body.gender === "female") {
+        sizeFilters.gender = "nu";
+      } else if (body.gender === "male") {
+        sizeFilters.gender = "nam";
+      }
+
+      delete sizeFilters.sizeSuggestion;
+
+      if (
+        ["nam", "nu", "unisex"].includes(sizeFilters.categorySlug) ||
+        !hasSpecificCategoryCue(userMessage)
+      ) {
+        delete sizeFilters.categorySlug;
+      }
+
+      if (
+        sizeFilters.gender === "nu" &&
+        typeof sizeFilters.categorySlug === "string" &&
+        /(^|-)nam($|-)/.test(sizeFilters.categorySlug)
+      ) {
+        delete sizeFilters.categorySlug;
+      }
+
+      if (
+        sizeFilters.gender === "nam" &&
+        typeof sizeFilters.categorySlug === "string" &&
+        /(^|-)nu($|-)/.test(sizeFilters.categorySlug)
+      ) {
+        delete sizeFilters.categorySlug;
+      }
+
       const result = await queryProducts(sizeFilters, {
         page: Math.max(1, Number(page) || 1),
         limit: Math.min(100, Math.max(1, Number(limit) || 6)),
@@ -3358,13 +3849,23 @@ exports.chatSearch = async (req, res) => {
         sizeSuggestion: suggestedSize,
       };
 
-      const fallbackReply = buildSizeAdviceReply(body, suggestedSize, result.total);
+      const responseProducts = attachProductReasons(
+        result.products,
+        {},
+        responseFilters
+      );
+
+      const fallbackReply = buildSizeAdviceReply(
+        body,
+        suggestedSize,
+        result.total
+      );
 
       const aiReply = await generateAssistantReply({
         userMessage,
         conversationText,
         intent: "size_advice",
-        products: result.products,
+        products: responseProducts,
         filters: responseFilters,
         metrics: {
           total: result.total,
@@ -3382,7 +3883,7 @@ exports.chatSearch = async (req, res) => {
       return res.json({
         reply: aiReply || fallbackReply,
         filters: responseFilters,
-        products: result.products,
+        products: responseProducts,
         metrics: {
           total: result.total,
           page: result.page,
@@ -3390,105 +3891,61 @@ exports.chatSearch = async (req, res) => {
         },
       });
     }
+
     if (merged.intent === "sale_products") {
       const saleKeywords = filterKeywordsForSale(merged.keywords);
 
-      const hasSpecificSaleTarget = Boolean(
-        merged.categorySlug ||
-        merged.brand ||
-        merged.color ||
-        merged.size ||
-        merged.gender ||
-        (saleKeywords && saleKeywords.length)
-      );
-
-      const broadSaleQuery = isBroadSaleQuery(userMessage) && !hasSpecificSaleTarget;
-
       const saleFilters = {
         ...merged,
+        intent: "sale_products",
         saleOnly: true,
         sortBy: merged.sortBy || "discount",
         sortOrder: merged.sortOrder || "desc",
-        keywords: broadSaleQuery ? null : saleKeywords,
+        keywords: saleKeywords,
       };
 
-      if (broadSaleQuery) {
+      if (
+        ["nam", "nu", "unisex"].includes(saleFilters.categorySlug) &&
+        !hasSpecificCategoryCue(userMessage)
+      ) {
         delete saleFilters.categorySlug;
-        delete saleFilters.brand;
-        delete saleFilters.color;
-        delete saleFilters.size;
       }
 
-      let result = await queryProducts(saleFilters, {
+      if (
+        saleFilters.gender === "nu" &&
+        typeof saleFilters.categorySlug === "string" &&
+        /(^|-)nam($|-)/.test(saleFilters.categorySlug)
+      ) {
+        delete saleFilters.categorySlug;
+      }
+
+      if (
+        saleFilters.gender === "nam" &&
+        typeof saleFilters.categorySlug === "string" &&
+        /(^|-)nu($|-)/.test(saleFilters.categorySlug)
+      ) {
+        delete saleFilters.categorySlug;
+      }
+
+      const result = await queryProducts(saleFilters, {
         page: Math.max(1, Number(page) || 1),
         limit: Math.min(100, Math.max(1, Number(limit) || 12)),
       });
 
-      if (!result.total) {
-        const fallbackSaleFilters = {
-          intent: "sale_products",
-          saleOnly: true,
-          sortBy: "discount",
-          sortOrder: "desc",
-          keywords: null,
-          gender: saleFilters.gender || merged.gender || null,
-        };
+      const responseProducts = attachProductReasons(
+        result.products,
+        {},
+        saleFilters
+      );
 
-        result = await queryProducts(fallbackSaleFilters, {
-          page: Math.max(1, Number(page) || 1),
-          limit: Math.min(100, Math.max(1, Number(limit) || 12)),
-        });
-
-        const fallbackReply = result.total
-          ? buildSaleReply(result.total, result.products)
-          : buildSaleReply(0, []);
-
-        const aiReply = await generateAssistantReply({
-          userMessage,
-          conversationText,
-          intent: "sale_products",
-          products: result.products,
-          filters: fallbackSaleFilters,
-          metrics: {
-            total: result.total,
-            page: result.page,
-            limit: result.limit,
-          },
-        });
-
-        return res.json({
-          reply: aiReply || fallbackReply,
-          filters: fallbackSaleFilters,
-          products: result.products,
-          metrics: {
-            total: result.total,
-            page: result.page,
-            limit: result.limit,
-          },
-        });
-      }
-
-      const fallbackReply = isBestDiscountQuestion(userMessage)
+      const reply = isBestDiscountQuestion(userMessage)
         ? buildBestDiscountReply(result.products)
-        : buildSaleReply(result.total, result.products);
-
-      const aiReply = await generateAssistantReply({
-        userMessage,
-        conversationText,
-        intent: "sale_products",
-        products: result.products,
-        filters: saleFilters,
-        metrics: {
-          total: result.total,
-          page: result.page,
-          limit: result.limit,
-        },
-      });
+        : buildSaleReply(result.total, result.products, saleFilters);
 
       return res.json({
-        reply: aiReply || fallbackReply,
+        reply,
         filters: saleFilters,
-        products: result.products,
+        products: responseProducts,
         metrics: {
           total: result.total,
           page: result.page,
