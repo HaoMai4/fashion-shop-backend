@@ -215,8 +215,46 @@ const CATEGORY_ALIASES = [
     aliases: ["quan short", "short", "quan dui", "quan đui"],
   },
   {
-    slugCandidates: ["quan-dai", "quan-dai-nam", "quan-tay"],
-    aliases: ["quan dai", "quan tay", "quan kaki", "quan jean", "jean"],
+    slugCandidates: [
+      "quan-jeans",
+      "quan-jean",
+      "jeans",
+      "jean",
+      "quan-dai",
+      "quan-dai-nam",
+      "quan-tay",
+    ],
+    aliases: [
+      "quan jeans",
+      "quần jeans",
+      "quan jean",
+      "quần jean",
+      "jeans",
+      "jean",
+      "denim",
+    ],
+  },
+  {
+    slugCandidates: [
+      "quan-dai",
+      "quan-dai-nam",
+      "quan-tay",
+      "quan-nam",
+      "quan",
+    ],
+    aliases: [
+      "quan",
+      "quần",
+      "quan nam",
+      "quần nam",
+      "quan dai",
+      "quần dài",
+      "quan tay",
+      "quần tây",
+      "quan kaki",
+      "quần kaki",
+      "kaki",
+    ],
   },
   {
     slugCandidates: ["do-the-thao", "the-thao"],
@@ -1670,12 +1708,23 @@ async function detectCategorySlugFromText(text) {
       return group.slugCandidates.some((candidate) => {
         const candidateNorm = normalizePhrase(candidate);
 
-        return (
-          slugNorm.includes(candidateNorm) ||
-          candidateNorm.includes(slugNorm) ||
-          nameNorm.includes(candidateNorm) ||
-          group.aliases.some((alias) => nameNorm.includes(normalizePhrase(alias)))
-        );
+        const slugMatched =
+          slugNorm === candidateNorm ||
+          slugNorm.includes(candidateNorm);
+
+        const nameMatched =
+          nameNorm === candidateNorm ||
+          nameNorm.includes(candidateNorm);
+
+        const aliasMatched = group.aliases.some((alias) => {
+          const aliasNorm = normalizePhrase(alias);
+          return (
+            nameNorm === aliasNorm ||
+            nameNorm.includes(aliasNorm)
+          );
+        });
+
+        return slugMatched || nameMatched || aliasMatched;
       });
     });
 
@@ -2467,6 +2516,8 @@ function shouldKeepPreviousFilters(userMessage, parsed, previousFilters) {
     return true;
   }
 
+
+
   // Nếu câu mới có anchor sản phẩm rõ ràng thì coi là truy vấn mới.
   if (hasCurrentProductAnchor(parsed)) return false;
 
@@ -2746,6 +2797,46 @@ function isStyleFollowUpMessage(message) {
   ].some((term) => text.includes(normalizeText(term)));
 }
 
+function isCategoryRefinementFollowUp(message) {
+  const text = normalizePhrase(message || "");
+  if (!text) return false;
+
+  const tokens = text.split(" ").filter(Boolean);
+  const shortEnough = tokens.length <= 7;
+
+  const hasCategoryCue = [
+    "quan",
+    "quan dai",
+    "quan tay",
+    "quan jean",
+    "quan jeans",
+    "jean",
+    "jeans",
+    "kaki",
+    "short",
+    "ao",
+    "ao polo",
+    "polo",
+    "ao so mi",
+    "so mi",
+    "ao thun",
+    "thun",
+    "ao khoac",
+  ].some((term) => hasPhrase(text, term));
+
+  const hasFollowUpCue = [
+    "co",
+    "khong",
+    "nua",
+    "them",
+    "nao",
+    "mau nao",
+    "loai nao",
+  ].some((term) => hasPhrase(text, term));
+
+  return hasCategoryCue && (shortEnough || hasFollowUpCue);
+}
+
 function getStyleContextForCurrentMessage(userMessage, recentUserMessages = []) {
   const currentContext = extractStyleContext(userMessage);
 
@@ -2799,6 +2890,68 @@ function getOutfitSearchPlans(message, styleContext = {}) {
   });
   const genderAwareCategory = (maleSlug) =>
     styleContext.gender === "nu" ? "nu" : maleSlug;
+
+  const wantsJeans =
+    text.includes("quan jean") ||
+    text.includes("quan jeans") ||
+    text.includes("jean") ||
+    text.includes("jeans") ||
+    text.includes("denim");
+
+  const wantsPants =
+    wantsJeans ||
+    hasPhrase(text, "quan") ||
+    text.includes("quan dai") ||
+    text.includes("quan tay") ||
+    text.includes("kaki");
+
+  if (wantsJeans) {
+    return [
+      {
+        label:
+          styleContext.gender === "nam"
+            ? "quần jeans nam dễ mặc và dễ phối"
+            : "quần jeans dễ phối",
+        filters: {
+          intent: "search_products",
+          keywords: ["jean"],
+          ...genderFilter,
+        },
+      },
+      {
+        label: "quần kaki hoặc quần dài dễ phối",
+        filters: withOptionalCategory(genderAwareCategory("quan-dai"), {
+          intent: "search_products",
+          keywords: ["kaki"],
+          ...genderFilter,
+        }),
+      },
+    ];
+  }
+
+  if (wantsPants) {
+    return [
+      {
+        label:
+          styleContext.gender === "nam"
+            ? "quần nam dễ mặc hằng ngày"
+            : "quần dễ mặc hằng ngày",
+        filters: withOptionalCategory(genderAwareCategory("quan-dai"), {
+          intent: "search_products",
+          keywords: null,
+          ...genderFilter,
+        }),
+      },
+      {
+        label: "quần short thoải mái, dễ vận động",
+        filters: withOptionalCategory(genderAwareCategory("quan-short"), {
+          intent: "search_products",
+          keywords: ["short"],
+          ...genderFilter,
+        }),
+      },
+    ];
+  }
 
   if (
     isFemaleContext &&
@@ -3223,16 +3376,31 @@ function buildOutfitAdviceReply(userMessage, styleContext = {}, products = []) {
 
   const text = normalizeText(userMessage || "");
 
-  if (
-    hasProducts &&
-    (
-      text.includes("tang qua") ||
-      text.includes("qua tang") ||
-      text.includes("tang vo") ||
-      text.includes("qua cho vo")
-    )
-  ) {
+  const isGiftQuery =
+    text.includes("tang") ||
+    text.includes("tang qua") ||
+    text.includes("qua tang") ||
+    text.includes("qua cho");
+
+  const isGiftForWife =
+    styleContext.gender === "nu" ||
+    text.includes("vo") ||
+    text.includes("ban gai") ||
+    text.includes("me");
+
+  const isGiftForHusband =
+    styleContext.gender === "nam" ||
+    text.includes("chong") ||
+    text.includes("ban trai") ||
+    text.includes("bo") ||
+    text.includes("ba");
+
+  if (hasProducts && isGiftQuery && isGiftForWife) {
     return "Với quà tặng cho vợ, mình ưu tiên các món dễ mặc, màu sắc nhẹ nhàng và ít kén dáng. Các sản phẩm bên dưới phù hợp để tặng vì có thể dùng trong nhiều dịp, dễ phối và có lý do gợi ý riêng để bạn cân nhắc.";
+  }
+
+  if (hasProducts && isGiftQuery && isGiftForHusband) {
+    return "Với quà tặng cho chồng, mình ưu tiên các món dễ mặc, dễ phối và an toàn về phong cách như áo polo, sơ mi, quần dài hoặc quần short. Các sản phẩm bên dưới phù hợp để tặng vì dễ dùng trong nhiều dịp và có lý do gợi ý riêng để bạn cân nhắc.";
   }
 
   if (
@@ -3374,6 +3542,13 @@ exports.chatSearch = async (req, res) => {
       parsed.categorySlug = categorySlug;
     }
 
+    if (
+      isCategoryRefinementFollowUp(userMessage) &&
+      ["nam", "nu", "unisex"].includes(parsed.categorySlug)
+    ) {
+      parsed.categorySlug = null;
+    }
+
     if (!parsed.brand && brand) {
       parsed.brand = brand;
     }
@@ -3439,6 +3614,36 @@ exports.chatSearch = async (req, res) => {
       merged.gender = currentMessageGender;
     }
 
+    const previousContextGender =
+      contextFilters?.gender || contextFilters?.styleContext?.gender || null;
+
+    if (
+      !merged.gender &&
+      previousContextGender &&
+      isCategoryRefinementFollowUp(userMessage)
+    ) {
+      merged.gender = previousContextGender;
+    }
+
+    if (
+      isCategoryRefinementFollowUp(userMessage) &&
+      !isStyleFollowUpMessage(userMessage) &&
+      !isStandaloneBudgetQuestion(userMessage) &&
+      !isExplicitSaleQuestion(userMessage)
+    ) {
+      merged.intent = "search_products";
+
+      if (!hasExplicitSizeCue(userMessage)) {
+        delete merged.size;
+        delete merged.sizeSuggestion;
+      }
+
+      if (!hasPriceCue(userMessage)) {
+        delete merged.minPrice;
+        delete merged.maxPrice;
+      }
+    }
+
     if (isStandaloneBudgetQuestion(userMessage)) {
       delete merged.gender;
       delete merged.size;
@@ -3486,6 +3691,7 @@ exports.chatSearch = async (req, res) => {
         styleContextForGender.gender &&
         (
           isStyleFollowUpMessage(userMessage) ||
+          isCategoryRefinementFollowUp(userMessage) ||
           shouldKeepPreviousFilters(userMessage, parsed, contextFilters)
         )
       ) {
