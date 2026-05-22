@@ -750,6 +750,628 @@ exports.getForecast = async (req, res) => {
   }
 };
 
+function calculateChangePercent(current, previous) {
+  const cur = Number(current || 0);
+  const prev = Number(previous || 0);
+
+  if (prev === 0) {
+    if (cur > 0) return 100;
+    return 0;
+  }
+
+  return Number((((cur - prev) / prev) * 100).toFixed(1));
+}
+
+function getBusinessInsightRange(query) {
+  const explicitStart = parseDate(query.startDate);
+  const explicitEnd = parseDate(query.endDate, true);
+
+  if (explicitStart && explicitEnd) {
+    const diffMs = explicitEnd.getTime() - explicitStart.getTime();
+    const rangeDays = Math.max(1, Math.ceil(diffMs / 86400000));
+
+    return {
+      rangeDays,
+      startDate: explicitStart,
+      endDate: explicitEnd,
+    };
+  }
+
+  const rangeDays = Math.min(
+    180,
+    Math.max(7, parseInt(query.rangeDays || query.periodDays, 10) || 30)
+  );
+
+  const endDate = new Date();
+  endDate.setHours(23, 59, 59, 999);
+
+  const startDate = new Date(endDate);
+  startDate.setDate(startDate.getDate() - (rangeDays - 1));
+  startDate.setHours(0, 0, 0, 0);
+
+  return {
+    rangeDays,
+    startDate,
+    endDate,
+  };
+}
+
+function getPreviousRange(startDate, rangeDays) {
+  const previousEndDate = new Date(startDate);
+  previousEndDate.setDate(previousEndDate.getDate() - 1);
+  previousEndDate.setHours(23, 59, 59, 999);
+
+  const previousStartDate = new Date(previousEndDate);
+  previousStartDate.setDate(previousStartDate.getDate() - (rangeDays - 1));
+  previousStartDate.setHours(0, 0, 0, 0);
+
+  return {
+    previousStartDate,
+    previousEndDate,
+  };
+}
+
+function sumStatusCounts(statusCounts, statuses) {
+  return statuses.reduce((sum, status) => {
+    return sum + Number(statusCounts[status] || 0);
+  }, 0);
+}
+
+function buildBusinessRecommendations({
+  summary,
+  forecast,
+  topProducts,
+  slowProducts,
+  lowStockItems,
+}) {
+  const recommendations = [];
+
+  if (summary.revenue <= 0 || summary.completedOrders <= 0) {
+    recommendations.push({
+      type: "data",
+      priority: "medium",
+      title: "Cần thêm dữ liệu bán hàng",
+      message:
+        "Dữ liệu đơn hàng đã thanh toán trong kỳ còn ít, nên các nhận định kinh doanh chỉ nên xem là tham khảo.",
+      action:
+        "Tiếp tục ghi nhận đơn hàng thực tế và dùng dữ liệu 30 đến 90 ngày để phân tích chính xác hơn.",
+    });
+  }
+
+  if (forecast.trend === "up") {
+    recommendations.push({
+      type: "growth",
+      priority: "high",
+      title: "Xu hướng doanh thu đang tăng",
+      message:
+        "Doanh thu gần đây có dấu hiệu tăng so với giai đoạn liền trước.",
+      action:
+        "Nên ưu tiên hiển thị sản phẩm bán chạy trên trang chủ, banner hoặc khu vực gợi ý để tận dụng đà tăng.",
+    });
+  } else if (forecast.trend === "down") {
+    recommendations.push({
+      type: "campaign",
+      priority: "high",
+      title: "Doanh thu có dấu hiệu giảm",
+      message:
+        "Doanh thu 7 ngày gần nhất thấp hơn giai đoạn trước, cần có hành động kích cầu.",
+      action:
+        "Có thể triển khai voucher ngắn hạn, flash sale hoặc đẩy các sản phẩm đang tồn kho nhiều nhưng bán chậm.",
+    });
+  } else {
+    recommendations.push({
+      type: "stability",
+      priority: "medium",
+      title: "Doanh thu tương đối ổn định",
+      message:
+        "Doanh thu gần đây chưa có biến động mạnh, phù hợp để tối ưu danh mục và tồn kho.",
+      action:
+        "Nên tiếp tục theo dõi top sản phẩm, sản phẩm bán chậm và thử các chương trình ưu đãi nhỏ để tăng tỷ lệ chuyển đổi.",
+    });
+  }
+
+  if (topProducts?.length) {
+    const top = topProducts[0];
+
+    recommendations.push({
+      type: "product_focus",
+      priority: "high",
+      title: "Tập trung sản phẩm bán chạy",
+      message: `${top.productName} đang là sản phẩm nổi bật với ${top.qtySold || 0} sản phẩm đã bán.`,
+      action:
+        "Nên đưa sản phẩm này vào khu vực nổi bật, gợi ý AI, banner hoặc combo phối đồ để tăng khả năng mua thêm.",
+    });
+  }
+
+  const riskySlowProducts = (slowProducts || []).filter((item) => {
+    return Number(item.totalStock || 0) >= 10 && Number(item.qtySold || 0) <= 1;
+  });
+
+  if (riskySlowProducts.length) {
+    const item = riskySlowProducts[0];
+
+    recommendations.push({
+      type: "slow_stock",
+      priority: "high",
+      title: "Cần xử lý sản phẩm tồn kho bán chậm",
+      message: `${item.name} còn tồn khoảng ${item.totalStock || 0} sản phẩm nhưng bán rất ít trong kỳ.`,
+      action:
+        "Nên cân nhắc giảm giá, tạo combo, đưa vào mục sale hoặc dùng làm sản phẩm gợi ý kèm theo sản phẩm bán chạy.",
+    });
+  }
+
+  if (lowStockItems?.length) {
+    const item = lowStockItems[0];
+
+    recommendations.push({
+      type: "inventory",
+      priority: "high",
+      title: "Có sản phẩm gần hết hàng",
+      message: `${item.productName || "Một sản phẩm"} màu ${item.color || "không rõ"} size ${item.size || "không rõ"} chỉ còn ${item.stock || 0} sản phẩm.`,
+      action:
+        "Nên kiểm tra tồn kho và nhập thêm nếu đây là sản phẩm đang có nhu cầu tốt.",
+    });
+  }
+
+  if (summary.cancelledOrders > 0) {
+    recommendations.push({
+      type: "order_quality",
+      priority: "medium",
+      title: "Theo dõi đơn hủy",
+      message: `Trong kỳ có ${summary.cancelledOrders} đơn bị hủy.`,
+      action:
+        "Nên xem lại lý do hủy đơn, thời gian xác nhận đơn, phí vận chuyển và tình trạng tồn kho để giảm tỷ lệ hủy.",
+    });
+  }
+
+  return recommendations.slice(0, 6);
+}
+
+exports.getBusinessInsight = async (req, res) => {
+  try {
+    const { rangeDays, startDate, endDate } = getBusinessInsightRange(req.query);
+    const { previousStartDate, previousEndDate } = getPreviousRange(startDate, rangeDays);
+
+    const currentMatch = {
+      createdAt: {
+        $gte: startDate,
+        $lte: endDate,
+      },
+    };
+
+    const previousMatch = {
+      createdAt: {
+        $gte: previousStartDate,
+        $lte: previousEndDate,
+      },
+    };
+
+    const [currentOverview] = await Order.aggregate([
+      {
+        $match: currentMatch,
+      },
+      {
+        $facet: {
+          paidTotals: [
+            {
+              $match: {
+                "paymentMethod.status": "paid",
+              },
+            },
+            {
+              $group: {
+                _id: null,
+                revenue: { $sum: "$totalAmount" },
+                paidOrders: { $sum: 1 },
+                averageOrderValue: { $avg: "$totalAmount" },
+              },
+            },
+          ],
+          byStatus: [
+            {
+              $group: {
+                _id: "$orderStatus",
+                count: { $sum: 1 },
+              },
+            },
+          ],
+          byPayment: [
+            {
+              $group: {
+                _id: "$paymentMethod.status",
+                count: { $sum: 1 },
+              },
+            },
+          ],
+          uniqueCustomers: [
+            {
+              $group: {
+                _id: {
+                  $ifNull: ["$userId", "$guestInfo.email"],
+                },
+              },
+            },
+            {
+              $group: {
+                _id: null,
+                count: { $sum: 1 },
+              },
+            },
+          ],
+        },
+      },
+    ]);
+
+    const [previousOverview] = await Order.aggregate([
+      {
+        $match: {
+          ...previousMatch,
+          "paymentMethod.status": "paid",
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          revenue: { $sum: "$totalAmount" },
+          paidOrders: { $sum: 1 },
+          averageOrderValue: { $avg: "$totalAmount" },
+        },
+      },
+    ]);
+
+    const paidTotals = currentOverview?.paidTotals?.[0] || {};
+    const statusCounts = (currentOverview?.byStatus || []).reduce((acc, item) => {
+      acc[item._id || "unknown"] = item.count;
+      return acc;
+    }, {});
+    const paymentCounts = (currentOverview?.byPayment || []).reduce((acc, item) => {
+      acc[item._id || "unknown"] = item.count;
+      return acc;
+    }, {});
+
+    const completedOrders = sumStatusCounts(statusCounts, [
+      "completed",
+      "delivered",
+      "hoan_thanh",
+      "da_giao",
+    ]);
+
+    const cancelledOrders = sumStatusCounts(statusCounts, [
+      "cancelled",
+      "canceled",
+      "da_huy",
+    ]);
+
+    const totalOrders = Object.values(statusCounts).reduce((sum, value) => {
+      return sum + Number(value || 0);
+    }, 0);
+
+    const summary = {
+      revenue: Math.round(paidTotals.revenue || 0),
+      paidOrders: paidTotals.paidOrders || 0,
+      totalOrders,
+      completedOrders,
+      cancelledOrders,
+      averageOrderValue: Math.round(paidTotals.averageOrderValue || 0),
+      uniqueCustomers: currentOverview?.uniqueCustomers?.[0]?.count || 0,
+      revenueChangePercent: calculateChangePercent(
+        paidTotals.revenue || 0,
+        previousOverview?.revenue || 0
+      ),
+      orderChangePercent: calculateChangePercent(
+        paidTotals.paidOrders || 0,
+        previousOverview?.paidOrders || 0
+      ),
+      statusCounts,
+      paymentCounts,
+    };
+
+    const salesRows = await Order.aggregate([
+      {
+        $match: {
+          ...currentMatch,
+          "paymentMethod.status": "paid",
+        },
+      },
+      {
+        $group: {
+          _id: {
+            year: { $year: "$createdAt" },
+            month: { $month: "$createdAt" },
+            day: { $dayOfMonth: "$createdAt" },
+          },
+          orders: { $sum: 1 },
+          revenue: { $sum: "$totalAmount" },
+        },
+      },
+      {
+        $sort: {
+          "_id.year": 1,
+          "_id.month": 1,
+          "_id.day": 1,
+        },
+      },
+    ]);
+
+    const salesMap = {};
+    for (const row of salesRows) {
+      const key = `${row._id.year}-${String(row._id.month).padStart(2, "0")}-${String(
+        row._id.day
+      ).padStart(2, "0")}`;
+
+      salesMap[key] = {
+        orders: row.orders || 0,
+        revenue: row.revenue || 0,
+      };
+    }
+
+    const revenueLabels = buildLabels("day", startDate, endDate);
+    const revenueSeries = revenueLabels.map((label) => ({
+      date: label,
+      revenue: Math.round(salesMap[label]?.revenue || 0),
+      orders: salesMap[label]?.orders || 0,
+    }));
+
+    const last7 = revenueSeries.slice(-7);
+    const previous7 = revenueSeries.slice(-14, -7);
+
+    const last7Revenue = last7.reduce((sum, item) => sum + Number(item.revenue || 0), 0);
+    const previous7Revenue = previous7.reduce((sum, item) => sum + Number(item.revenue || 0), 0);
+
+    const totalPeriodRevenue = revenueSeries.reduce(
+      (sum, item) => sum + Number(item.revenue || 0),
+      0
+    );
+
+    const activeRevenueDays = revenueSeries.filter(
+      (item) => Number(item.revenue || 0) > 0
+    ).length;
+
+    const averageByFullPeriod = Math.round(
+      totalPeriodRevenue / Math.max(1, revenueSeries.length)
+    );
+
+    const averageByActiveDays = Math.round(
+      totalPeriodRevenue / Math.max(1, activeRevenueDays)
+    );
+
+    let dailyAverage = Math.round(last7Revenue / Math.max(1, last7.length));
+    let forecastMethodNote = "Dự báo dựa trên trung bình doanh thu 7 ngày gần nhất.";
+
+    if (dailyAverage <= 0 && totalPeriodRevenue > 0) {
+      dailyAverage = averageByFullPeriod;
+      forecastMethodNote =
+        "7 ngày gần nhất chưa có doanh thu, nên hệ thống dùng trung bình toàn kỳ làm mức dự báo tham khảo.";
+    }
+
+    const next7DaysRevenue = dailyAverage * 7;
+    const trendPercent = calculateChangePercent(last7Revenue, previous7Revenue);
+
+    let trend = "stable";
+    if (trendPercent >= 10) trend = "up";
+    if (trendPercent <= -10) trend = "down";
+
+    const forecast = {
+      method: "moving_average_7_days",
+      methodNote: forecastMethodNote,
+      dailyAverage,
+      averageByFullPeriod,
+      averageByActiveDays,
+      next7DaysRevenue,
+      trend,
+      trendPercent,
+      forecastDays: Array.from({ length: 7 }).map((_, index) => {
+        const date = new Date(endDate);
+        date.setDate(date.getDate() + index + 1);
+
+        return {
+          date: date.toISOString().slice(0, 10),
+          expectedRevenue: dailyAverage,
+        };
+      }),
+    };
+
+    const topProducts = await getTopProductRowsForExport({
+      startDate: startDate.toISOString().slice(0, 10),
+      endDate: endDate.toISOString().slice(0, 10),
+      limit: 8,
+    });
+
+    const slowProducts = await Product.aggregate([
+      {
+        $lookup: {
+          from: "productvariants",
+          let: { pid: "$_id" },
+          pipeline: [
+            {
+              $match: {
+                $expr: { $eq: ["$productId", "$$pid"] },
+              },
+            },
+            {
+              $unwind: {
+                path: "$sizes",
+                preserveNullAndEmptyArrays: true,
+              },
+            },
+            {
+              $group: {
+                _id: "$productId",
+                totalStock: { $sum: { $ifNull: ["$sizes.stock", 0] } },
+                sampleImage: { $first: { $arrayElemAt: ["$images", 0] } },
+              },
+            },
+          ],
+          as: "inventory",
+        },
+      },
+      {
+        $lookup: {
+          from: "orders",
+          let: { pid: "$_id" },
+          pipeline: [
+            {
+              $match: {
+                ...currentMatch,
+                "paymentMethod.status": "paid",
+              },
+            },
+            {
+              $unwind: "$items",
+            },
+            {
+              $match: {
+                $expr: { $eq: ["$items.productId", "$$pid"] },
+              },
+            },
+            {
+              $group: {
+                _id: "$items.productId",
+                qtySold: { $sum: "$items.quantity" },
+              },
+            },
+          ],
+          as: "sold",
+        },
+      },
+      {
+        $addFields: {
+          totalStock: {
+            $ifNull: [{ $arrayElemAt: ["$inventory.totalStock", 0] }, 0],
+          },
+          sampleImage: {
+            $ifNull: [{ $arrayElemAt: ["$inventory.sampleImage", 0] }, null],
+          },
+          qtySold: {
+            $ifNull: [{ $arrayElemAt: ["$sold.qtySold", 0] }, 0],
+          },
+        },
+      },
+      {
+        $match: {
+          totalStock: { $gt: 0 },
+        },
+      },
+      {
+        $addFields: {
+          slowScore: {
+            $divide: ["$totalStock", { $add: ["$qtySold", 1] }],
+          },
+        },
+      },
+      {
+        $sort: {
+          slowScore: -1,
+          totalStock: -1,
+          qtySold: 1,
+        },
+      },
+      {
+        $limit: 8,
+      },
+      {
+        $project: {
+          _id: 1,
+          name: 1,
+          slug: 1,
+          totalStock: 1,
+          qtySold: 1,
+          slowScore: 1,
+          sampleImage: 1,
+        },
+      },
+    ]);
+
+    const lowStockItems = await ProductVariant.aggregate([
+      {
+        $unwind: "$sizes",
+      },
+      {
+        $match: {
+          "sizes.stock": {
+            $gte: 0,
+            $lte: 5,
+          },
+        },
+      },
+      {
+        $lookup: {
+          from: "products",
+          localField: "productId",
+          foreignField: "_id",
+          as: "product",
+        },
+      },
+      {
+        $unwind: {
+          path: "$product",
+          preserveNullAndEmptyArrays: true,
+        },
+      },
+      {
+        $match: {
+          "product._id": { $exists: true },
+        },
+      },
+      {
+        $project: {
+          _id: 1,
+          productId: 1,
+          productName: "$product.name",
+          productSlug: "$product.slug",
+          color: 1,
+          colorCode: 1,
+          size: "$sizes.size",
+          stock: "$sizes.stock",
+          price: "$sizes.price",
+          discountPrice: "$sizes.discountPrice",
+          image: { $arrayElemAt: ["$images", 0] },
+        },
+      },
+      {
+        $sort: {
+          stock: 1,
+          productName: 1,
+        },
+      },
+      {
+        $limit: 12,
+      },
+    ]);
+
+    const recommendations = buildBusinessRecommendations({
+      summary,
+      forecast,
+      topProducts,
+      slowProducts,
+      lowStockItems,
+    });
+
+    return res.json({
+      rangeDays,
+      startDate,
+      endDate,
+      summary,
+      revenueSeries,
+      forecast,
+      topProducts,
+      slowProducts,
+      lowStockItems,
+      voucherStats: [],
+      recommendations,
+      aiSummary: null,
+      note:
+        "Business Insight hiện dùng dữ liệu thật và luật phân tích nội bộ. Gemini có thể được gắn ở bước sau để viết nhận xét tự nhiên hơn.",
+    });
+  } catch (err) {
+    console.error("getBusinessInsight error:", err);
+    return res.status(500).json({
+      message: "Lỗi khi lấy AI Business Insight",
+      error: err.message,
+    });
+  }
+};
+
 exports.exportStatsToExcel = async (req, res) => {
   try {
     const dateMatch = buildDateMatch(req.query, 90);

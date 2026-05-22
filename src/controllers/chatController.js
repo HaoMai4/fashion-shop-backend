@@ -216,13 +216,12 @@ const CATEGORY_ALIASES = [
   },
   {
     slugCandidates: [
+      "quan-jeans-nam",
+      "quan-jean-nam",
       "quan-jeans",
       "quan-jean",
       "jeans",
       "jean",
-      "quan-dai",
-      "quan-dai-nam",
-      "quan-tay",
     ],
     aliases: [
       "quan jeans",
@@ -1736,6 +1735,88 @@ async function detectCategorySlugFromText(text) {
   return null;
 }
 
+function findCategorySlugByTerms(categories = [], terms = []) {
+  const normalizedTerms = terms.map((term) => normalizePhrase(term)).filter(Boolean);
+
+  const scored = (categories || [])
+    .map((category) => {
+      const slug = normalizePhrase(category.slug || "");
+      const name = normalizePhrase(category.name || "");
+      const haystack = `${slug} ${name}`;
+
+      let score = 0;
+
+      for (const term of normalizedTerms) {
+        if (!term) continue;
+
+        if (slug === term) score += 100;
+        if (name === term) score += 90;
+        if (slug.includes(term)) score += 50 + term.length;
+        if (name.includes(term)) score += 40 + term.length;
+        if (haystack.includes(term)) score += 20 + term.length;
+      }
+
+      return {
+        category,
+        score,
+      };
+    })
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  return scored[0]?.category?.slug || null;
+}
+
+function isJeansQuery(message) {
+  const text = normalizePhrase(message || "");
+
+  return [
+    "quan jeans",
+    "quan jean",
+    "quần jeans",
+    "quần jean",
+    "jeans",
+    "jean",
+    "denim",
+  ].some((term) => hasPhrase(text, term));
+}
+
+function isGenericPantsQuery(message) {
+  const text = normalizePhrase(message || "");
+
+  const hasPants = hasPhrase(text, "quan") || hasPhrase(text, "quần");
+
+  const hasSpecificPantsType = [
+    "jean",
+    "jeans",
+    "denim",
+    "short",
+    "kaki",
+    "tay",
+    "tây",
+    "jogger",
+  ].some((term) => hasPhrase(text, term));
+
+  return hasPants && !hasSpecificPantsType;
+}
+
+function resolveCategoryOverrideFromMessage(message, categories = []) {
+  if (isJeansQuery(message)) {
+    return (
+      findCategorySlugByTerms(categories, [
+        "quan jeans nam",
+        "quan jean nam",
+        "quan jeans",
+        "quan jean",
+        "jeans",
+        "jean",
+      ]) || "quan-jeans-nam"
+    );
+  }
+
+  return null;
+}
+
 async function semanticCategoryBrand(textLower) {
   const { categories, brands } = await loadMeta();
   const textNorm = normalizeText(textLower);
@@ -2912,19 +2993,27 @@ function getOutfitSearchPlans(message, styleContext = {}) {
           styleContext.gender === "nam"
             ? "quần jeans nam dễ mặc và dễ phối"
             : "quần jeans dễ phối",
+        filters: withOptionalCategory(genderAwareCategory("quan-jeans-nam"), {
+          intent: "search_products",
+          keywords: null,
+          ...genderFilter,
+        }),
+      },
+      {
+        label: "quần denim hoặc quần jeans dự phòng",
+        filters: {
+          intent: "search_products",
+          keywords: ["jeans"],
+          ...genderFilter,
+        },
+      },
+      {
+        label: "quần jean dự phòng",
         filters: {
           intent: "search_products",
           keywords: ["jean"],
           ...genderFilter,
         },
-      },
-      {
-        label: "quần kaki hoặc quần dài dễ phối",
-        filters: withOptionalCategory(genderAwareCategory("quan-dai"), {
-          intent: "search_products",
-          keywords: ["kaki"],
-          ...genderFilter,
-        }),
       },
     ];
   }
@@ -2949,6 +3038,14 @@ function getOutfitSearchPlans(message, styleContext = {}) {
           keywords: ["short"],
           ...genderFilter,
         }),
+      },
+      {
+        label: "quần jeans hoặc quần dài dự phòng",
+        filters: {
+          intent: "search_products",
+          keywords: ["quần"],
+          ...genderFilter,
+        },
       },
     ];
   }
@@ -3380,7 +3477,15 @@ function buildOutfitAdviceReply(userMessage, styleContext = {}, products = []) {
     text.includes("tang") ||
     text.includes("tang qua") ||
     text.includes("qua tang") ||
-    text.includes("qua cho");
+    text.includes("qua cho") ||
+    text.includes("mua do cho chong") ||
+    text.includes("mua cho chong") ||
+    text.includes("do cho chong") ||
+    text.includes("cho chong") ||
+    text.includes("mua do cho vo") ||
+    text.includes("mua cho vo") ||
+    text.includes("do cho vo") ||
+    text.includes("cho vo");
 
   const isGiftForWife =
     styleContext.gender === "nu" ||
@@ -3537,9 +3642,22 @@ exports.chatSearch = async (req, res) => {
     const lower = userMessage.toLowerCase();
     const shouldInferCategoryFromMessage = hasSpecificCategoryCue(userMessage);
     const { categorySlug, brand } = await semanticCategoryBrand(lower);
+    const { categories } = await loadMeta();
 
     if (shouldInferCategoryFromMessage && !parsed.categorySlug && categorySlug) {
       parsed.categorySlug = categorySlug;
+    }
+
+    const categoryOverride = resolveCategoryOverrideFromMessage(userMessage, categories);
+
+    if (categoryOverride) {
+      parsed.categorySlug = categoryOverride;
+      parsed.keywords = null;
+    }
+
+    if (isGenericPantsQuery(userMessage) && !categoryOverride) {
+      parsed.categorySlug = null;
+      parsed.keywords = ["quần"];
     }
 
     if (

@@ -11,6 +11,7 @@ router.get('/top-products', statisController.getTopProducts);
 router.get('/slow-products', statisController.getSlowProducts);
 router.get('/top-customers', statisController.getTopCustomers);
 router.get('/forecast', statisController.getForecast);
+router.get('/business-insight', statisController.getBusinessInsight);
 router.get('/export-excel', statisController.exportStatsToExcel);
 
 module.exports = router;
