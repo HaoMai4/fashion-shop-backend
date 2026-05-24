@@ -3,6 +3,20 @@ const Order = require("../models/Order");
 const ProductVariant = require("../models/ProductVariant");
 const Product = require("../models/Product");
 const ExcelJS = require("exceljs");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+
+const GEMINI_API_KEY = process.env.GOOGLE_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+
+let genAI = null;
+
+if (GEMINI_API_KEY) {
+  try {
+    genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  } catch (error) {
+    console.warn("Init Gemini for Business Insight failed:", error.message);
+  }
+}
 
 function parseDate(value, endOfDay = false) {
   if (!value) return null;
@@ -927,6 +941,103 @@ function buildBusinessRecommendations({
   return recommendations.slice(0, 6);
 }
 
+async function generateBusinessInsightSummary({
+  rangeDays,
+  summary,
+  forecast,
+  topProducts,
+  slowProducts,
+  lowStockItems,
+  recommendations,
+}) {
+  if (!genAI) return null;
+
+  try {
+    const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
+
+    const compactData = {
+      rangeDays,
+      summary: {
+        revenue: summary.revenue,
+        paidOrders: summary.paidOrders,
+        totalOrders: summary.totalOrders,
+        completedOrders: summary.completedOrders,
+        cancelledOrders: summary.cancelledOrders,
+        averageOrderValue: summary.averageOrderValue,
+        uniqueCustomers: summary.uniqueCustomers,
+        revenueChangePercent: summary.revenueChangePercent,
+        orderChangePercent: summary.orderChangePercent,
+      },
+      forecast: {
+        method: forecast.method,
+        methodNote: forecast.methodNote,
+        dailyAverage: forecast.dailyAverage,
+        next7DaysRevenue: forecast.next7DaysRevenue,
+        trend: forecast.trend,
+        trendPercent: forecast.trendPercent,
+      },
+      topProducts: (topProducts || []).slice(0, 5).map((item) => ({
+        productName: item.productName,
+        color: item.color,
+        size: item.size,
+        qtySold: item.qtySold,
+        revenue: item.revenue,
+      })),
+      slowProducts: (slowProducts || []).slice(0, 5).map((item) => ({
+        name: item.name,
+        totalStock: item.totalStock,
+        qtySold: item.qtySold,
+      })),
+      lowStockItems: (lowStockItems || []).slice(0, 5).map((item) => ({
+        productName: item.productName,
+        color: item.color,
+        size: item.size,
+        stock: item.stock,
+      })),
+      recommendations: (recommendations || []).slice(0, 5).map((item) => ({
+        title: item.title,
+        message: item.message,
+        action: item.action,
+        priority: item.priority,
+      })),
+    };
+
+    const prompt = `
+Bạn là AI phân tích kinh doanh cho website thời trang StyleHub.
+
+Dữ liệu dưới đây đã được backend tính từ database thật. Không được tự bịa thêm số liệu, không được thay đổi số liệu, không được suy luận thêm ngoài dữ liệu được cung cấp.
+
+Quy tắc bắt buộc:
+- Trả lời bằng tiếng Việt.
+- Không chào hỏi.
+- Không dùng markdown, không dùng dấu **, không dùng bảng.
+- Viết ngắn gọn, chuyên nghiệp, tối đa 180 từ.
+- Chỉ dùng các số liệu có trong JSON.
+- Nếu forecast.trend là "down" và forecast.trendPercent là -100, hãy diễn giải là "7 ngày gần nhất chưa phát sinh doanh thu" hoặc "xu hướng ngắn hạn đang giảm", không được nói "giảm 100% so với trung bình kỳ".
+- Nếu dữ liệu đơn hủy cao, hãy nhắc quản trị viên cần kiểm tra nguyên nhân hủy đơn.
+- Đưa ra 2 đến 3 hành động marketing ưu tiên.
+- Không dùng cụm "tỷ lệ hủy đơn" nếu không có phần trăm. Nếu chỉ có số lượng, hãy viết "số đơn hủy".
+- Khi nhắc doanh thu hoặc giá trị tiền, hãy thêm đơn vị "đ".
+
+Bố cục trả lời:
+Đoạn 1: Tóm tắt tình hình kinh doanh.
+Đoạn 2: Nhận xét xu hướng và rủi ro chính.
+Đoạn 3: Đề xuất hành động ưu tiên.
+
+Dữ liệu:
+${JSON.stringify(compactData, null, 2)}
+`;
+
+    const result = await model.generateContent(prompt);
+    const text = result?.response?.text?.() || "";
+
+    return text.trim() || null;
+  } catch (error) {
+    console.warn("generateBusinessInsightSummary error:", error.message);
+    return null;
+  }
+}
+
 exports.getBusinessInsight = async (req, res) => {
   try {
     const { rangeDays, startDate, endDate } = getBusinessInsightRange(req.query);
@@ -1347,6 +1458,16 @@ exports.getBusinessInsight = async (req, res) => {
       lowStockItems,
     });
 
+    const aiSummary = await generateBusinessInsightSummary({
+      rangeDays,
+      summary,
+      forecast,
+      topProducts,
+      slowProducts,
+      lowStockItems,
+      recommendations,
+    });
+
     return res.json({
       rangeDays,
       startDate,
@@ -1359,9 +1480,17 @@ exports.getBusinessInsight = async (req, res) => {
       lowStockItems,
       voucherStats: [],
       recommendations,
-      aiSummary: null,
+      aiSummary:
+        aiSummary ||
+        `Trong ${rangeDays} ngày gần đây, hệ thống ghi nhận doanh thu ${summary.revenue.toLocaleString("vi-VN")}đ từ ${summary.paidOrders} đơn đã thanh toán, với giá trị đơn trung bình khoảng ${summary.averageOrderValue.toLocaleString("vi-VN")}đ. Doanh thu thay đổi ${summary.revenueChangePercent}% so với kỳ trước.
+
+Xu hướng ngắn hạn hiện đang ${forecast.trend === "down" ? "giảm" : forecast.trend === "up" ? "tăng" : "ổn định"}. Trong kỳ có ${summary.cancelledOrders} đơn bị hủy, quản trị viên nên kiểm tra nguyên nhân hủy đơn và theo dõi chất lượng xử lý đơn hàng.
+
+Nên ưu tiên đẩy mạnh sản phẩm bán chạy, triển khai ưu đãi ngắn hạn cho nhóm sản phẩm bán chậm và kiểm tra các biến thể gần hết hàng để tránh mất cơ hội bán.`,
       note:
-        "Business Insight hiện dùng dữ liệu thật và luật phân tích nội bộ. Gemini có thể được gắn ở bước sau để viết nhận xét tự nhiên hơn.",
+        aiSummary
+          ? "Business Insight sử dụng dữ liệu thật từ hệ thống và Gemini để tạo nhận định tự nhiên cho quản trị viên."
+          : "Business Insight sử dụng dữ liệu thật và fallback nội bộ vì Gemini hiện không khả dụng.",
     });
   } catch (err) {
     console.error("getBusinessInsight error:", err);

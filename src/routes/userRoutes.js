@@ -19,6 +19,8 @@ const {
   addToWishlist,
   removeFromWishlist,
   getWishlist,
+  listCustomers,
+  getCustomerDetail,
   listStaffs,
   createStaffByAdmin,
   updateStaff,
@@ -56,6 +58,10 @@ router.post("/address", authMiddleware, addAddress);
 router.put("/address/:addressId", authMiddleware, updateAddress);
 router.delete("/address/:addressId", authMiddleware, deleteAddress);
 router.patch("/address/:addressId/default", authMiddleware, setDefaultAddress);
+
+// Admin customer routes
+router.get("/admin/customers", authMiddleware, adminOnly, listCustomers);
+router.get("/admin/customers/:id", authMiddleware, adminOnly, getCustomerDetail);
 
 // Admin staff routes
 router.get("/admin/staffs", authMiddleware, adminOnly, listStaffs);

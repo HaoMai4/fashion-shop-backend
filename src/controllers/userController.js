@@ -1,6 +1,7 @@
 const mongoose = require("mongoose");
 const User = require("../models/User");
 const Product = require("../models/Product");
+const Order = require("../models/Order");
 const generateToken = require("../utils/generateToken");
 const { comparePassword, hashPassword } = require("../utils/hashPassword");
 const {
@@ -53,6 +54,43 @@ async function getPopulatedWishlist(userId) {
     });
 
   return user;
+}
+
+function getFullName(user) {
+  return [user.firstName, user.lastName].filter(Boolean).join(" ").trim();
+}
+
+function getCustomerTag({ totalOrders, paidOrders, cancelledOrders, totalSpent }) {
+  const orders = Number(totalOrders || 0);
+  const paid = Number(paidOrders || 0);
+  const cancelled = Number(cancelledOrders || 0);
+  const spent = Number(totalSpent || 0);
+
+  if (orders === 0 || paid === 0) return "new";
+  if (cancelled >= 3 && cancelled >= paid) return "risk";
+  if (spent >= 5000000 || paid >= 5) return "vip";
+  if (spent >= 2000000 || paid >= 2) return "potential";
+
+  return "regular";
+}
+
+function getCustomerTagLabel(tag) {
+  const map = {
+    new: "Khách mới",
+    regular: "Khách thường",
+    potential: "Khách tiềm năng",
+    vip: "Khách VIP",
+    risk: "Hay hủy đơn",
+  };
+
+  return map[tag] || "Khách thường";
+}
+
+function buildCustomerStatsMap(rows = []) {
+  return rows.reduce((acc, item) => {
+    acc[String(item._id)] = item;
+    return acc;
+  }, {});
 }
 
 // =========================
@@ -858,6 +896,283 @@ exports.verifyOtpController = async (req, res) => {
   } catch (error) {
     console.error("verifyOtpController error:", error);
     res.status(500).json({ message: error.message });
+  }
+};
+
+// =========================
+// Admin manage customers
+// =========================
+exports.listCustomers = async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const skip = (page - 1) * limit;
+
+    const q = String(req.query.q || "").trim();
+    const status = String(req.query.status || "").trim();
+    const tag = String(req.query.tag || "").trim();
+
+    const filter = {
+      role: "customer",
+    };
+
+    if (status && ["active", "inactive", "blocked"].includes(status)) {
+      filter.status = status;
+    }
+
+    if (q) {
+      const regex = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [
+        { firstName: regex },
+        { lastName: regex },
+        { email: regex },
+        { phone: regex },
+      ];
+    }
+
+    const [users, total] = await Promise.all([
+      User.find(filter)
+        .select("firstName lastName email phone role status avatar createdAt")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      User.countDocuments(filter),
+    ]);
+
+    const userIds = users.map((user) => user._id);
+
+    const statsRows = userIds.length
+      ? await Order.aggregate([
+        {
+          $match: {
+            userId: { $in: userIds },
+          },
+        },
+        {
+          $group: {
+            _id: "$userId",
+            totalOrders: { $sum: 1 },
+            paidOrders: {
+              $sum: {
+                $cond: [{ $eq: ["$paymentMethod.status", "paid"] }, 1, 0],
+              },
+            },
+            completedOrders: {
+              $sum: {
+                $cond: [
+                  {
+                    $in: [
+                      "$orderStatus",
+                      ["completed", "delivered", "hoan_thanh", "da_giao"],
+                    ],
+                  },
+                  1,
+                  0,
+                ],
+              },
+            },
+            cancelledOrders: {
+              $sum: {
+                $cond: [
+                  {
+                    $in: [
+                      "$orderStatus",
+                      ["cancelled", "canceled", "da_huy"],
+                    ],
+                  },
+                  1,
+                  0,
+                ],
+              },
+            },
+            totalSpent: {
+              $sum: {
+                $cond: [
+                  { $eq: ["$paymentMethod.status", "paid"] },
+                  "$totalAmount",
+                  0,
+                ],
+              },
+            },
+            lastOrderAt: { $max: "$createdAt" },
+          },
+        },
+      ])
+      : [];
+
+    const statsMap = buildCustomerStatsMap(statsRows);
+
+    let data = users.map((user) => {
+      const stats = statsMap[String(user._id)] || {};
+      const tagValue = getCustomerTag(stats);
+
+      return {
+        _id: user._id,
+        fullName: getFullName(user) || "Khách hàng",
+        firstName: user.firstName,
+        lastName: user.lastName,
+        email: user.email,
+        phone: user.phone || "",
+        avatar: user.avatar || "",
+        role: user.role,
+        status: user.status || "active",
+        createdAt: user.createdAt,
+        totalOrders: stats.totalOrders || 0,
+        paidOrders: stats.paidOrders || 0,
+        completedOrders: stats.completedOrders || 0,
+        cancelledOrders: stats.cancelledOrders || 0,
+        totalSpent: stats.totalSpent || 0,
+        lastOrderAt: stats.lastOrderAt || null,
+        customerTag: tagValue,
+        customerTagLabel: getCustomerTagLabel(tagValue),
+      };
+    });
+
+    if (tag) {
+      data = data.filter((item) => item.customerTag === tag);
+    }
+
+    return res.json({
+      data,
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    console.error("listCustomers error:", error);
+    return res.status(500).json({
+      message: "Lỗi khi lấy danh sách khách hàng",
+      error: error.message,
+    });
+  }
+};
+
+exports.getCustomerDetail = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "customerId không hợp lệ" });
+    }
+
+    const customer = await User.findOne({
+      _id: id,
+      role: "customer",
+    })
+      .select("-password -socialLogins -wishlist")
+      .lean();
+
+    if (!customer) {
+      return res.status(404).json({ message: "Không tìm thấy khách hàng" });
+    }
+
+    const [stats] = await Order.aggregate([
+      {
+        $match: {
+          userId: new mongoose.Types.ObjectId(id),
+        },
+      },
+      {
+        $group: {
+          _id: "$userId",
+          totalOrders: { $sum: 1 },
+          paidOrders: {
+            $sum: {
+              $cond: [{ $eq: ["$paymentMethod.status", "paid"] }, 1, 0],
+            },
+          },
+          completedOrders: {
+            $sum: {
+              $cond: [
+                {
+                  $in: [
+                    "$orderStatus",
+                    ["completed", "delivered", "hoan_thanh", "da_giao"],
+                  ],
+                },
+                1,
+                0,
+              ],
+            },
+          },
+          cancelledOrders: {
+            $sum: {
+              $cond: [
+                {
+                  $in: [
+                    "$orderStatus",
+                    ["cancelled", "canceled", "da_huy"],
+                  ],
+                },
+                1,
+                0,
+              ],
+            },
+          },
+          totalSpent: {
+            $sum: {
+              $cond: [
+                { $eq: ["$paymentMethod.status", "paid"] },
+                "$totalAmount",
+                0,
+              ],
+            },
+          },
+          lastOrderAt: { $max: "$createdAt" },
+        },
+      },
+    ]);
+
+    const recentOrders = await Order.find({
+      userId: id,
+    })
+      .select(
+        "orderCode orderStatus paymentMethod.status totalAmount createdAt items shippingAddress"
+      )
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .lean();
+
+    const totalOrders = stats?.totalOrders || 0;
+    const paidOrders = stats?.paidOrders || 0;
+    const totalSpent = stats?.totalSpent || 0;
+    const averageOrderValue = paidOrders > 0 ? Math.round(totalSpent / paidOrders) : 0;
+
+    const customerTag = getCustomerTag({
+      totalOrders,
+      paidOrders,
+      cancelledOrders: stats?.cancelledOrders || 0,
+      totalSpent,
+    });
+
+    return res.json({
+      customer: {
+        ...customer,
+        fullName: getFullName(customer) || "Khách hàng",
+      },
+      stats: {
+        totalOrders,
+        paidOrders,
+        completedOrders: stats?.completedOrders || 0,
+        cancelledOrders: stats?.cancelledOrders || 0,
+        totalSpent,
+        averageOrderValue,
+        lastOrderAt: stats?.lastOrderAt || null,
+        customerTag,
+        customerTagLabel: getCustomerTagLabel(customerTag),
+      },
+      recentOrders,
+    });
+  } catch (error) {
+    console.error("getCustomerDetail error:", error);
+    return res.status(500).json({
+      message: "Lỗi khi lấy chi tiết khách hàng",
+      error: error.message,
+    });
   }
 };
 
