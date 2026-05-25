@@ -33,6 +33,31 @@ const OrderItemSchema = new mongoose.Schema(
       default: 0,
     },
     image: String,
+    isGift: {
+      type: Boolean,
+      default: false,
+    },
+
+    giftFromCampaignId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Campaign",
+      default: null,
+    },
+
+    giftRuleId: {
+      type: mongoose.Schema.Types.ObjectId,
+      default: null,
+    },
+
+    giftRuleType: {
+      type: String,
+      default: "",
+    },
+
+    giftNote: {
+      type: String,
+      default: "",
+    },
   },
   { _id: false }
 );

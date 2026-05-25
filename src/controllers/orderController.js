@@ -4,6 +4,9 @@ const Cart = require("../models/Cart");
 const Voucher = require("../models/Voucher");
 const User = require("../models/User");
 const OrderReport = require("../models/OrderReport");
+const Campaign = require("../models/Campaign");
+const ProductVariant = require("../models/ProductVariant");
+const Product = require("../models/Product");
 const {
   hydrateItems,
   decreaseStock,
@@ -573,6 +576,130 @@ async function sendZNS(order, type) {
   }
 }
 
+function isCampaignActiveNow(campaign) {
+  if (!campaign || campaign.status !== "active") return false;
+
+  const now = Date.now();
+
+  if (campaign.startDate) {
+    const startTime = new Date(campaign.startDate).getTime();
+    if (!Number.isNaN(startTime) && now < startTime) return false;
+  }
+
+  if (campaign.endDate) {
+    const endTime = new Date(campaign.endDate).getTime();
+    if (!Number.isNaN(endTime) && now > endTime) return false;
+  }
+
+  return true;
+}
+
+function normalizeSize(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+async function buildGiftItemFromRule(campaign, rule) {
+  const variant = await ProductVariant.findById(rule.giftVariantId)
+    .populate("productId", "name slug")
+    .lean();
+
+  if (!variant) return null;
+
+  const giftSize = (variant.sizes || []).find(
+    (size) => normalizeSize(size.size) === normalizeSize(rule.giftSize)
+  );
+
+  if (!giftSize) return null;
+
+  const giftQuantity = Math.max(1, Number(rule.giftQuantity || 1));
+  const stock = Number(giftSize.stock || 0);
+
+  if (stock < giftQuantity) {
+    return null;
+  }
+
+  const product = variant.productId;
+
+  return {
+    productId: product?._id || rule.giftProductId,
+    variantId: variant._id,
+    name: product?.name || "Quà tặng",
+    sku: giftSize.sku || "",
+    color: variant.color || "",
+    size: giftSize.size || rule.giftSize,
+    quantity: giftQuantity,
+    price: 0,
+    discountPrice: 0,
+    finalPrice: 0,
+    image: Array.isArray(variant.images) ? variant.images[0] || "" : "",
+    isGift: true,
+    giftFromCampaignId: campaign._id,
+    giftRuleId: rule._id,
+    giftRuleType: rule.type || "buy_x_get_gift",
+    giftNote:
+      rule.note ||
+      `Quà tặng từ campaign ${campaign.name || ""}`.trim(),
+  };
+}
+
+async function applyCampaignGiftRules(orderItems) {
+  const activeCampaigns = await Campaign.find({
+    status: "active",
+    "giftRules.0": { $exists: true },
+  }).lean();
+
+  if (!activeCampaigns.length) {
+    return {
+      items: orderItems,
+      gifts: [],
+    };
+  }
+
+  const gifts = [];
+  const appliedRuleKeys = new Set();
+
+  for (const campaign of activeCampaigns) {
+    if (!isCampaignActiveNow(campaign)) continue;
+
+    const giftRules = Array.isArray(campaign.giftRules)
+      ? campaign.giftRules.filter((rule) => rule.active !== false)
+      : [];
+
+    for (const rule of giftRules) {
+      if (rule.type !== "buy_x_get_gift") continue;
+      if (!rule.buyProductId || !rule.giftProductId || !rule.giftVariantId) {
+        continue;
+      }
+
+      const buyProductId = String(rule.buyProductId);
+      const minQuantity = Math.max(1, Number(rule.minQuantity || 1));
+
+      const boughtQuantity = orderItems
+        .filter((item) => !item.isGift)
+        .filter((item) => String(item.productId) === buyProductId)
+        .reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+
+      if (boughtQuantity < minQuantity) continue;
+
+      const ruleKey = `${campaign._id}:${rule._id}`;
+
+      if (appliedRuleKeys.has(ruleKey)) continue;
+
+      const giftItem = await buildGiftItemFromRule(campaign, rule);
+
+      if (!giftItem) continue;
+
+      gifts.push(giftItem);
+      appliedRuleKeys.add(ruleKey);
+    }
+  }
+
+  return {
+    items: [...orderItems, ...gifts],
+    gifts,
+  };
+}
+
 exports.createOrder = async (req, res) => {
   try {
     const {
@@ -602,12 +729,17 @@ exports.createOrder = async (req, res) => {
       return res.status(400).json({ message: "Thiếu phương thức thanh toán" });
     }
 
-    const orderItems = await hydrateItems(items);
+    const hydratedItems = await hydrateItems(items);
 
-    const subtotal = orderItems.reduce(
-      (sum, item) => sum + (item.price || 0) * (item.quantity || 0),
-      0
-    );
+    const giftResult = await applyCampaignGiftRules(hydratedItems);
+    const orderItems = giftResult.items;
+
+    const subtotal = orderItems
+      .filter((item) => !item.isGift)
+      .reduce(
+        (sum, item) => sum + (item.price || 0) * (item.quantity || 0),
+        0
+      );
 
     const shippingFee = Number(req.body.shippingFee || 0);
     const userId = req.user?.id || req.user?._id || req.user?.userId || null;
