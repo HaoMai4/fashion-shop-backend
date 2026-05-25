@@ -1800,6 +1800,114 @@ function isGenericPantsQuery(message) {
   return hasPants && !hasSpecificPantsType;
 }
 
+function getRequestedProductFamily(message) {
+  const text = normalizePhrase(message || "");
+
+  if (
+    isJeansQuery(message) ||
+    isGenericPantsQuery(message) ||
+    hasPhrase(text, "quan short") ||
+    hasPhrase(text, "short") ||
+    hasPhrase(text, "quan dai") ||
+    hasPhrase(text, "quan tay") ||
+    hasPhrase(text, "kaki") ||
+    hasPhrase(text, "jogger")
+  ) {
+    return "pants";
+  }
+
+  if (
+    hasPhrase(text, "ao polo") ||
+    hasPhrase(text, "ao so mi") ||
+    hasPhrase(text, "so mi") ||
+    hasPhrase(text, "ao thun") ||
+    hasPhrase(text, "thun") ||
+    hasPhrase(text, "ao khoac") ||
+    hasPhrase(text, "ao")
+  ) {
+    return "tops";
+  }
+
+  if (
+    hasPhrase(text, "vay") ||
+    hasPhrase(text, "chan vay") ||
+    hasPhrase(text, "đầm") ||
+    hasPhrase(text, "dam")
+  ) {
+    return "dress";
+  }
+
+  return null;
+}
+
+function hasAnyPhraseInText(text, terms = []) {
+  return terms.some((term) => hasPhrase(text, term));
+}
+
+function productMatchesFamily(product, family) {
+  if (!family) return true;
+
+  const name = normalizePhrase(product?.name || "");
+  const categoryName = normalizePhrase(product?.category?.name || "");
+  const categorySlug = normalizePhrase(product?.category?.slug || "");
+  const categoryText = `${categoryName} ${categorySlug}`;
+
+  const pantsTerms = [
+    "quan",
+    "jean",
+    "jeans",
+    "denim",
+    "short",
+    "kaki",
+    "tay",
+    "jogger",
+  ];
+
+  const topTerms = [
+    "ao",
+    "polo",
+    "so mi",
+    "thun",
+    "khoac",
+    "shirt",
+    "tshirt",
+  ];
+
+  const dressTerms = [
+    "vay",
+    "chan vay",
+    "dam",
+    "dress",
+  ];
+
+  const nameHasPants = hasAnyPhraseInText(name, pantsTerms);
+  const nameHasTop = hasAnyPhraseInText(name, topTerms);
+  const nameHasDress = hasAnyPhraseInText(name, dressTerms);
+
+  if (family === "pants") {
+    if (nameHasTop || nameHasDress) return false;
+    if (nameHasPants) return true;
+
+    return hasAnyPhraseInText(categoryText, pantsTerms);
+  }
+
+  if (family === "tops") {
+    if (nameHasPants || nameHasDress) return false;
+    if (nameHasTop) return true;
+
+    return hasAnyPhraseInText(categoryText, topTerms);
+  }
+
+  if (family === "dress") {
+    if (nameHasPants || nameHasTop) return false;
+    if (nameHasDress) return true;
+
+    return hasAnyPhraseInText(categoryText, dressTerms);
+  }
+
+  return true;
+}
+
 function resolveCategoryOverrideFromMessage(message, categories = []) {
   if (isJeansQuery(message)) {
     return (
@@ -1810,7 +1918,22 @@ function resolveCategoryOverrideFromMessage(message, categories = []) {
         "quan jean",
         "jeans",
         "jean",
-      ]) || "quan-jeans-nam"
+      ]) || null
+    );
+  }
+
+  if (isGenericPantsQuery(message)) {
+    return (
+      findCategorySlugByTerms(categories, [
+        "quan nam",
+        "quan dai nam",
+        "quan dai",
+        "quan tay",
+        "quan",
+        "quan short",
+        "quan jeans",
+        "quan jean",
+      ]) || null
     );
   }
 
@@ -2160,6 +2283,7 @@ async function queryProducts(filters, pagination) {
     sortOrder = "desc",
     saleOnly = false,
     gender,
+    productFamily,
   } = filters;
 
   const { page = 1, limit = 30 } = pagination;
@@ -2406,6 +2530,14 @@ async function queryProducts(filters, pagination) {
     });
   }
 
+  if (productFamily) {
+    for (let i = enriched.length - 1; i >= 0; i--) {
+      if (!productMatchesFamily(enriched[i], productFamily)) {
+        enriched.splice(i, 1);
+      }
+    }
+  }
+
   const importantKeywords = (strongKeywords || []).filter((k) => {
     const norm = normalizeText(k);
     if (GENERIC_WORDS.has(norm)) return false;
@@ -2545,6 +2677,7 @@ function mergeFilters(prev, next) {
   if (next.sortBy) merged.sortBy = next.sortBy;
   if (next.sortOrder) merged.sortOrder = next.sortOrder;
   if (next.saleOnly != null) merged.saleOnly = next.saleOnly;
+  if (next.productFamily) merged.productFamily = next.productFamily;
   if (next.intent) merged.intent = next.intent;
 
   return merged;
@@ -2995,6 +3128,7 @@ function getOutfitSearchPlans(message, styleContext = {}) {
             : "quần jeans dễ phối",
         filters: withOptionalCategory(genderAwareCategory("quan-jeans-nam"), {
           intent: "search_products",
+          productFamily: "pants",
           keywords: null,
           ...genderFilter,
         }),
@@ -3003,6 +3137,7 @@ function getOutfitSearchPlans(message, styleContext = {}) {
         label: "quần denim hoặc quần jeans dự phòng",
         filters: {
           intent: "search_products",
+          productFamily: "pants",
           keywords: ["jeans"],
           ...genderFilter,
         },
@@ -3011,6 +3146,7 @@ function getOutfitSearchPlans(message, styleContext = {}) {
         label: "quần jean dự phòng",
         filters: {
           intent: "search_products",
+          productFamily: "pants",
           keywords: ["jean"],
           ...genderFilter,
         },
@@ -3027,6 +3163,7 @@ function getOutfitSearchPlans(message, styleContext = {}) {
             : "quần dễ mặc hằng ngày",
         filters: withOptionalCategory(genderAwareCategory("quan-dai"), {
           intent: "search_products",
+          productFamily: "pants",
           keywords: null,
           ...genderFilter,
         }),
@@ -3035,6 +3172,7 @@ function getOutfitSearchPlans(message, styleContext = {}) {
         label: "quần short thoải mái, dễ vận động",
         filters: withOptionalCategory(genderAwareCategory("quan-short"), {
           intent: "search_products",
+          productFamily: "pants",
           keywords: ["short"],
           ...genderFilter,
         }),
@@ -3043,7 +3181,8 @@ function getOutfitSearchPlans(message, styleContext = {}) {
         label: "quần jeans hoặc quần dài dự phòng",
         filters: {
           intent: "search_products",
-          keywords: ["quần"],
+          productFamily: "pants",
+          keywords: null,
           ...genderFilter,
         },
       },
@@ -3649,15 +3788,37 @@ exports.chatSearch = async (req, res) => {
     }
 
     const categoryOverride = resolveCategoryOverrideFromMessage(userMessage, categories);
+    const requestedProductFamily = getRequestedProductFamily(userMessage);
 
     if (categoryOverride) {
       parsed.categorySlug = categoryOverride;
       parsed.keywords = null;
     }
 
-    if (isGenericPantsQuery(userMessage) && !categoryOverride) {
-      parsed.categorySlug = null;
-      parsed.keywords = ["quần"];
+    if (requestedProductFamily) {
+      parsed.productFamily = requestedProductFamily;
+    }
+
+    if (isGenericPantsQuery(userMessage)) {
+      parsed.productFamily = "pants";
+      parsed.keywords = null;
+
+      if (!parsed.categorySlug) {
+        const pantsCategory = findCategorySlugByTerms(categories, [
+          "quan nam",
+          "quan dai nam",
+          "quan dai",
+          "quan tay",
+          "quan",
+          "quan short",
+          "quan jeans",
+          "quan jean",
+        ]);
+
+        if (pantsCategory) {
+          parsed.categorySlug = pantsCategory;
+        }
+      }
     }
 
     if (
@@ -3891,6 +4052,7 @@ exports.chatSearch = async (req, res) => {
       delete merged.sortBy;
       delete merged.sortOrder;
       delete merged.saleOnly;
+      delete merged.productFamily;
     }
 
     if (["outfit_advice", "fashion_advice"].includes(merged.intent)) {
@@ -4037,10 +4199,24 @@ exports.chatSearch = async (req, res) => {
     }
 
     if (merged.intent === "outfit_advice") {
-      const styleContext = getStyleContextForCurrentMessage(
+      const rawStyleContext = getStyleContextForCurrentMessage(
         userMessage,
         recentUserMessages
       );
+
+      const styleContext = {
+        ...rawStyleContext,
+        gender: rawStyleContext.gender || merged.gender || null,
+      };
+
+      if (styleContext.gender && !merged.gender) {
+        merged.gender = styleContext.gender;
+      }
+
+      if (!merged.productFamily) {
+        const family = getRequestedProductFamily(userMessage);
+        if (family) merged.productFamily = family;
+      }
 
       if (CHAT_DEBUG) {
         console.log("[CHAT_DEBUG] styleContext =>", styleContext);
@@ -4055,7 +4231,24 @@ exports.chatSearch = async (req, res) => {
         styleContext
       );
 
-      let outfitProducts = pickDiverseOutfitProducts(outfitResult.products, 4);
+      const familyLockedOutfitProducts = merged.productFamily
+        ? outfitResult.products.filter((product) =>
+          productMatchesFamily(product, merged.productFamily)
+        )
+        : outfitResult.products;
+
+      let outfitProducts = pickDiverseOutfitProducts(familyLockedOutfitProducts, 4);
+
+      if (CHAT_DEBUG && merged.productFamily) {
+        console.log(
+          "[CHAT_DEBUG] family locked outfit products =>",
+          familyLockedOutfitProducts.map((p) => ({
+            name: p.name,
+            category: p.category?.slug || p.category?.name,
+            productFamily: merged.productFamily,
+          }))
+        );
+      }
 
       outfitProducts = attachProductReasons(
         outfitProducts,
