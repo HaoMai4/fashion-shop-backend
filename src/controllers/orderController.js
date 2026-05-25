@@ -700,6 +700,49 @@ async function applyCampaignGiftRules(orderItems) {
   };
 }
 
+exports.previewCampaignGifts = async (req, res) => {
+  try {
+    const { items } = req.body || {};
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.json({
+        gifts: [],
+        summary: {
+          qualified: false,
+          giftCount: 0,
+        },
+      });
+    }
+
+    const hydratedItems = await hydrateItems(items);
+    const giftResult = await applyCampaignGiftRules(hydratedItems);
+
+    const gifts = Array.isArray(giftResult.gifts) ? giftResult.gifts : [];
+
+    return res.json({
+      gifts,
+      summary: {
+        qualified: gifts.length > 0,
+        giftCount: gifts.reduce(
+          (sum, item) => sum + Number(item.quantity || 0),
+          0
+        ),
+      },
+    });
+  } catch (error) {
+    console.error("previewCampaignGifts error:", error);
+
+    return res.status(500).json({
+      message: error.message || "Lỗi khi xem trước quà tặng campaign",
+      gifts: [],
+      summary: {
+        qualified: false,
+        giftCount: 0,
+      },
+    });
+  }
+};
+
 exports.createOrder = async (req, res) => {
   try {
     const {

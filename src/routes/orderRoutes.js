@@ -3,6 +3,7 @@ const router = express.Router();
 
 const {
   createOrder,
+  previewCampaignGifts,
   getMyOrders,
   getMyOrderByCode,
   getOrderById,
@@ -29,6 +30,9 @@ const statisController = require("../controllers/statisController");
 
 // Create order
 router.post("/create-orders", authOptional, createOrder);
+
+// Preview campaign gifts
+router.post("/preview-campaign-gifts", authOptional, previewCampaignGifts);
 
 // PayOS webhook
 router.post("/payos/webhook", handlePayOSWebhook);
